@@ -67,6 +67,8 @@
 - **折叠/展开** — 点击标题栏按钮收起面板。
 - **数值切换** — 点击任意数字在短格式（`1.5K`）和原始值（`1,500`）之间切换。
 
+<img width="2033" height="1754" alt="image" src="https://github.com/user-attachments/assets/105d5f99-ff93-47b4-b490-780269ed8a11" />
+
 ---
 
 ## 原理简介
