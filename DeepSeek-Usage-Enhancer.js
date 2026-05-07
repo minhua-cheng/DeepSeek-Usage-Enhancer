@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DeepSeek Usage Enhancer 
 // @namespace    https://github.com/local/deepseek-usage-enhancer
-// @version      1.0.0
+// @version      1.2.0
 // @description  在 DeepSeek 用量页面直接注入今日数据：今日消费、今日请求数、今日Token、缓存命中率；图表悬停数字加千分位
 // @author       Jmkwang
 // @match        https://platform.deepseek.com/usage*
@@ -628,12 +628,21 @@
       pollCount++;
       tryAllInjections();
 
-      // 初始阶段每 500ms 快速轮询；稳定后降到 3s
+      // 初始阶段每 500ms 快速轮询；稳定后降到 10s
       if (pollFast && pollCount > 20) {
         pollFast = false;
       }
-      setTimeout(poll, pollFast ? 500 : 3000);
+      setTimeout(poll, pollFast ? 500 : 10000);
     }
+
+    // 切换标签页回来时，如果注入标记丢失（React 重绘），立即补注
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        pollCount = 0;
+        pollFast = true;
+        tryAllInjections();
+      }
+    });
 
     if (document.readyState === 'loading') {
       document.addEventListener('DOMContentLoaded', () => {
