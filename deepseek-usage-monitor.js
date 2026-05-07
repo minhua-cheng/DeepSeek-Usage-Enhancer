@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         DeepSeek Daily Monitor
 // @namespace    https://github.com/local/deepseek-usage-monitor
-// @version      1.1.1
+// @version      1.1.2
 // @description  拦截 DeepSeek 开放平台用量 API，在小窗口中展示完整数据（纯本地，无远程通信）
-// @author       Claude
+// @author       Jmkwang
 // @match        https://platform.deepseek.com/usage*
 // @run-at       document-start
 // @grant        none
