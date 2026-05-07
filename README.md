@@ -10,9 +10,8 @@
 
 ## 安装
 
-1. 首先给你的浏览器安装一个 **用户脚本管理器**（任选其一）：
+1. 首先给你的浏览器安装一个 **用户脚本管理器**：
    - [Tampermonkey](https://www.tampermonkey.net/)（推荐，支持 Chrome / Edge / Firefox）
-   - [Violentmonkey](https://violentmonkey.github.io/)（开源替代）
 
 2. 点击脚本管理器的「添加新脚本」，将本仓库中 `[deepseek-usage-injector.user.js](https://github.com/Jmkwang/DeepSeek-Usage-Enhancer/blob/main/DeepSeek%20Usage%20Enhancer.js)` 的**全部内容**粘贴进去，保存。
 
