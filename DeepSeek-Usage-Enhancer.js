@@ -628,11 +628,11 @@
       pollCount++;
       tryAllInjections();
 
-      // 初始阶段每 500ms 快速轮询；稳定后降到 10s
+      // 初始阶段每 500ms 快速轮询；稳定后降到 3s
       if (pollFast && pollCount > 20) {
         pollFast = false;
       }
-      setTimeout(poll, pollFast ? 500 : 10000);
+      setTimeout(poll, pollFast ? 500 : 3000);
     }
 
     // 切换标签页回来时，如果注入标记丢失（React 重绘），立即补注
