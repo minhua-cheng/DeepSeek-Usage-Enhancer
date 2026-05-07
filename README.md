@@ -13,7 +13,7 @@
 1. 首先给你的浏览器安装一个 **用户脚本管理器**：
    - [Tampermonkey](https://www.tampermonkey.net/)（推荐，支持 Chrome / Edge / Firefox）
 
-2. 点击脚本管理器的「添加新脚本」，将本仓库中 `https://github.com/Jmkwang/DeepSeek-Usage-Enhancer/blob/main/DeepSeek-Usage-Enhancer.js` 的**全部内容**粘贴进去，保存。
+2. 点击脚本管理器的「添加新脚本」，将本仓库中[JS](https://github.com/Jmkwang/DeepSeek-Usage-Enhancer/blob/main/DeepSeek-Usage-Enhancer.js) 的**全部内容**粘贴进去，保存。
 
 3. 脚本会自动生效。你什么都不用配置。
 
