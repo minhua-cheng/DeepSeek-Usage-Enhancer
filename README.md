@@ -24,7 +24,11 @@
 - **「今日消费」** — 紧挨着官方「本月消费」卡片，显示今天的消费金额（CNY）。
 - **今日/昨日请求次数** — 在每个模型的「API 请求次数」下方，追加展示昨天和今天的请求量。
 - **今日总 Tokens + 缓存命中率** — 在「Tokens」区域下方展示今日 Token 总量和缓存命中百分比，再也不用手动复制给计算器了。
+- <img width="1395" height="1695" alt="image" src="https://github.com/user-attachments/assets/83cb8169-8ed8-49a9-888e-316e8f1f8df8" />
+
 - **图表数字千分位** — 鼠标悬停在图表上时，所有 4 位以上的数字会自动加上逗号分隔（如 `1234567` → `1,234,567`），你也不想一位位数，对吧。
+- <img width="432" height="195" alt="image" src="https://github.com/user-attachments/assets/2e88d260-c002-4d3e-a54d-cff9d7ec77f3" />
+
 
 > 页面是 React 渲染的，脚本会持续监听 DOM 变化，即使页面重绘也不会丢失注入的数据。
 
