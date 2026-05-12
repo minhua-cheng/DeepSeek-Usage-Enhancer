@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DeepSeek Daily Monitor
 // @namespace    https://github.com/local/deepseek-usage-monitor
-// @version      1.1.2
+// @version      1.2.2
 // @description  拦截 DeepSeek 开放平台用量 API，在小窗口中展示完整数据（纯本地，无远程通信）
 // @author       Jmkwang
 // @match        https://platform.deepseek.com/usage*
@@ -17,7 +17,6 @@
   // ============================================================
   let bearerToken = null;
 
-  // 缓存各接口的最新原始数据
   let rawUserSummary = null;
   let rawUsageAmount = null;
   let rawUsageCost = null;
@@ -170,6 +169,7 @@
   function transformUsageCost(bizData) {
     const today = utcToday();
     let todayCost = 0;
+    const modelCosts = {};
     const currency = bizData.currency || 'CNY';
 
     if (bizData.days) {
@@ -177,15 +177,25 @@
       if (todayDay && todayDay.data) {
         for (const entry of todayDay.data) {
           if (entry.usage) {
+            let entryCost = 0;
             for (const u of entry.usage) {
-              todayCost += Number(u.amount) || 0;
+              entryCost += Number(u.amount) || 0;
+            }
+            todayCost += entryCost;
+            if (entry.model) {
+              const ml = entry.model.toLowerCase();
+              const isPro = ml.includes('pro') && (ml.includes('v4') || ml.includes('v-4'));
+              const isFlash = ml.includes('flash') && (ml.includes('v4') || ml.includes('v-4'));
+              if (isPro || isFlash) {
+                modelCosts[entry.model] = (modelCosts[entry.model] || 0) + entryCost;
+              }
             }
           }
         }
       }
     }
 
-    return { today_cost: { amount: Math.floor(todayCost * 100) / 100, currency } };
+    return { today_cost: { amount: Math.floor(todayCost * 100) / 100, currency }, model_costs: modelCosts };
   }
 
   function buildOutputPayload() {
@@ -201,6 +211,15 @@
     let costData = { today_cost: { amount: 0, currency: 'CNY' } };
     if (rawUsageCost) {
       costData = transformUsageCost(rawUsageCost);
+    }
+
+    // 将模型费用合并到模型数据中
+    if (costData.model_costs && usageData.models) {
+      for (const [model, cost] of Object.entries(costData.model_costs)) {
+        if (usageData.models[model]) {
+          usageData.models[model].cost = Math.floor(cost * 100) / 100;
+        }
+      }
     }
 
     return {
@@ -310,7 +329,7 @@
     const payload = buildOutputPayload();
     if (payload) {
       updatePanelData(payload);
-      updateStatus(payload);
+      updateSummaryBar(payload);
     }
   }
 
@@ -333,10 +352,9 @@
     return String(n);
   }
 
-  // 创建一个可点击切换短格式/原始数字的值元素
   function makeToggleValue(n) {
     const span = document.createElement('span');
-    span.className = 'ds-value';
+    span.className = 'ds-val-toggle';
     span.setAttribute('data-short', fmtNumShort(n));
     span.setAttribute('data-raw', fmtNumRaw(n));
     span.textContent = fmtNumShort(n);
@@ -364,9 +382,19 @@
   function loadPanelPos() {
     try {
       const saved = localStorage.getItem(PANEL_POS_KEY);
-      if (saved) return JSON.parse(saved);
+      if (saved) {
+        const pos = JSON.parse(saved);
+        // 钳制位置，确保面板在可视区域内
+        const w = pos.width || 320;
+        const h = 400; // 估算面板高度
+        if (pos.left !== null && pos.left !== undefined) {
+          pos.left = Math.max(0, Math.min(pos.left, window.innerWidth - 40));
+        }
+        pos.top = Math.max(0, Math.min(pos.top || 60, window.innerHeight - 60));
+        return pos;
+      }
     } catch { /* ignore */ }
-    return { top: 60, left: null, right: 12, width: 300, collapsed: false };
+    return { top: 60, left: null, right: 12, width: 320, collapsed: false };
   }
 
   function savePanelPos(pos) {
@@ -374,7 +402,6 @@
   }
 
   let panelPos = loadPanelPos();
-  let panelDataEl = null;
   let lastPayload = null;
 
   function injectPanel() {
@@ -389,85 +416,206 @@
       styleRight = 'right: ' + (pos.right || 12) + 'px;';
     }
     panel.style.cssText = 'top: ' + (pos.top || 60) + 'px;' + styleLeft + styleRight +
-      'width: ' + (pos.width || 300) + 'px;';
+      'width: ' + (pos.width || 320) + 'px;';
 
     panel.innerHTML = `
       <style>
         #ds-monitor-panel {
           position: fixed; z-index: 99999;
-          background: #1a1a2e; color: #e0e0e0; border: 1px solid #333;
-          border-radius: 8px; font-size: 12px; font-family: monospace;
-          box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+          background: rgba(30, 30, 46, 0.92);
+          backdrop-filter: blur(24px);
+          -webkit-backdrop-filter: blur(24px);
+          border: 1px solid rgba(255,255,255,0.1);
+          border-radius: 12px;
+          font-family: -apple-system, 'SF Pro Text', 'Helvetica Neue', sans-serif;
+          font-size: 12px; color: #cdd6f4;
+          box-shadow:
+            0 12px 40px rgba(0,0,0,0.5),
+            0 0 0 0.5px rgba(255,255,255,0.05);
           display: flex; flex-direction: column; overflow: hidden;
-          user-select: none; min-width: 220px;
+          user-select: none; min-width: 280px;
         }
-        #ds-monitor-panel .ds-titlebar {
+        #ds-monitor-panel.ds-collapsed .ds-body,
+        #ds-monitor-panel.ds-collapsed .ds-summary-bar { display: none; }
+
+        .ds-titlebar {
           display: flex; justify-content: space-between; align-items: center;
-          padding: 5px 10px; background: #1e1e36; border-bottom: 1px solid #333;
-          border-radius: 8px 8px 0 0; cursor: move; flex-shrink: 0; gap: 4px;
+          padding: 8px 14px;
+          border-bottom: 1px solid rgba(255,255,255,0.06);
+          cursor: move; flex-shrink: 0;
         }
-        #ds-monitor-panel.ds-collapsed .ds-titlebar { border-radius: 8px 8px 8px 8px; border-bottom: none; }
-        #ds-monitor-panel .ds-titlebar .title {
-          font-weight: bold; color: #4fc3f7; font-size: 13px; flex: 1;
+        .ds-titlebar-left { display: flex; align-items: baseline; gap: 4px; }
+        .ds-title {
+          font-size: 13px; font-weight: 600; color: #e5e5e5;
         }
-        #ds-monitor-panel .ds-titlebar button {
-          background: none; border: none; color: #888; cursor: pointer;
-          font-size: 14px; line-height: 1; padding: 0 3px; margin: 0;
+        .ds-title-models {
+          font-size: 11px; color: #6c7086;
+          font-family: 'SF Mono', 'Menlo', monospace;
         }
-        #ds-monitor-panel .ds-titlebar .ds-collapse:hover { color: #4fc3f7; }
-        #ds-monitor-panel .ds-body {
-          padding: 8px 10px; overflow-y: auto; flex: 1 1 auto; min-height: 0;
+        .ds-titlebar-actions { display: flex; align-items: center; gap: 2px; }
+        .ds-btn {
+          width: 26px; height: 26px; border: none; background: none;
+          color: #6c7086; cursor: pointer; border-radius: 6px;
+          display: flex; align-items: center; justify-content: center;
+          font-size: 14px; transition: all 0.15s;
         }
-        #ds-monitor-panel .ds-body::-webkit-scrollbar { width: 4px; }
-        #ds-monitor-panel .ds-body::-webkit-scrollbar-track { background: transparent; }
-        #ds-monitor-panel .ds-body::-webkit-scrollbar-thumb { background: #444; border-radius: 2px; }
-        #ds-monitor-panel .ds-section-title {
-          color: #81d4fa; font-weight: bold; margin: 6px 0 4px; font-size: 12px;
-          border-bottom: 1px solid #2a2a3e; padding-bottom: 2px;
+        .ds-btn:hover { background: rgba(255,255,255,0.08); color: #cdd6f4; }
+
+        .ds-body {
+          padding: 0; flex: 1 1 auto; min-height: 0;
         }
-        #ds-monitor-panel .ds-section-title:first-child { margin-top: 0; }
-        #ds-monitor-panel .ds-row {
-          display: flex; justify-content: space-between; margin: 2px 0; gap: 12px;
+
+        .ds-account-overview {
+          padding: 10px 14px; display: flex; gap: 10px;
         }
-        #ds-monitor-panel .ds-row .ds-label { color: #aaa; white-space: nowrap; }
-        #ds-monitor-panel .ds-row .ds-value { color: #e0e0e0; text-align: right; word-break: break-all; }
-        #ds-monitor-panel .ds-divider {
-          border: none; border-top: 1px solid #2a2a3e; margin: 6px 0;
+        .ds-acct-item { flex: 1; text-align: center; }
+        .ds-acct-label {
+          font-size: 9px; color: #6c7086; text-transform: uppercase;
+          letter-spacing: 0.5px; margin-bottom: 2px;
         }
-        #ds-monitor-panel .ds-statusbar {
-          display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-          padding: 5px 10px; border-top: 1px solid #333; background: #1e1e36;
-          border-radius: 0 0 8px 8px; flex-shrink: 0; font-size: 11px;
+        .ds-acct-value {
+          font-size: 20px; font-weight: 700; color: #cdd6f4;
+          font-variant-numeric: tabular-nums; line-height: 1;
         }
-        #ds-monitor-panel.ds-collapsed .ds-statusbar { border-radius: 0; border-top: none; display: none; }
-        #ds-monitor-panel .ds-model-block {
-          background: #1e1e36; border-radius: 4px; padding: 5px 8px; margin: 4px 0;
+        .ds-acct-value.accent {
+          background: linear-gradient(135deg, #89b4fa, #a6e3a1);
+          -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+          background-clip: text;
         }
-        #ds-monitor-panel .ds-model-name { color: #ffcc80; font-weight: bold; font-size: 11px; margin-bottom: 2px; }
-        #ds-monitor-panel .ds-no-data { color: #666; text-align: center; padding: 12px 0; }
+        .ds-acct-unit {
+          font-size: 10px; color: #585b70; margin-top: 2px;
+        }
+
+        .ds-section-gap {
+          height: 1px; background: rgba(255,255,255,0.06);
+          margin: 0 14px;
+        }
+
+        .ds-model-section { padding: 12px 14px; }
+        .ds-model-block {
+          background: rgba(0,0,0,0.2); border-radius: 8px;
+          padding: 10px 12px; margin-bottom: 8px;
+          border: 1px solid rgba(255,255,255,0.04);
+        }
+        .ds-model-block:last-child { margin-bottom: 0; }
+
+        .ds-model-row {
+          display: flex; align-items: center; justify-content: space-between;
+          margin-bottom: 8px;
+        }
+        .ds-model-id {
+          font-size: 12px; font-weight: 600;
+          font-family: 'SF Mono', 'Menlo', monospace; color: #fab387;
+        }
+        .ds-model-sep {
+          height: 1px; background: rgba(255,255,255,0.04);
+          margin-bottom: 8px;
+        }
+
+        .ds-metrics {
+          display: grid; grid-template-columns: 1fr 1fr 1fr;
+          gap: 6px 0;
+        }
+        .ds-metric {
+          display: flex; flex-direction: column; align-items: center;
+        }
+        .ds-metric-val {
+          font-size: 14px; font-weight: 600; color: #cdd6f4;
+          font-variant-numeric: tabular-nums; line-height: 1.2;
+        }
+        .ds-metric-val.green { color: #a6e3a1; }
+        .ds-metric-val.yellow { color: #f9e2af; }
+        .ds-metric-lbl {
+          font-size: 9px; color: #6c7086; margin-top: 2px;
+          text-transform: uppercase; letter-spacing: 0.3px;
+        }
+
+        .ds-cache-row {
+          margin-top: 8px; padding-top: 8px;
+          border-top: 1px solid rgba(255,255,255,0.04);
+          display: flex; align-items: center; gap: 8px;
+        }
+        .ds-cache-label {
+          font-size: 10px; color: #6c7086; white-space: nowrap;
+        }
+        .ds-cache-track {
+          flex: 1; height: 3px; background: rgba(255,255,255,0.06);
+          border-radius: 2px; overflow: hidden;
+        }
+        .ds-cache-fill {
+          height: 100%; border-radius: 2px;
+          background: linear-gradient(90deg, #89b4fa, #a6e3a1);
+        }
+        .ds-cache-pct {
+          font-size: 11px; font-weight: 600; color: #a6e3a1;
+          min-width: 36px; text-align: right;
+          font-variant-numeric: tabular-nums;
+        }
+
+        .ds-summary-bar {
+          display: flex; align-items: center; justify-content: center;
+          gap: 14px; padding: 10px 14px;
+          background: rgba(0,0,0,0.2);
+          border-top: 1px solid rgba(255,255,255,0.06);
+          font-size: 11px; color: #6c7086;
+        }
+        .ds-sum-val { color: #a6adc8; font-weight: 500; font-variant-numeric: tabular-nums; }
+        .ds-summary-dot {
+          width: 3px; height: 3px; border-radius: 50%; background: #45475a;
+        }
+
+        .ds-no-data { color: #585b70; text-align: center; padding: 20px 0; font-size: 12px; }
+        .ds-val-toggle { font-variant-numeric: tabular-nums; }
       </style>
       <div class="ds-titlebar" id="ds-titlebar">
-        <span class="title">DeepSeek Daily Monitor</span>
-        <button class="ds-collapse" id="ds-collapse-btn" title="收起/展开">${pos.collapsed ? '▶' : '▼'}</button>
+        <div class="ds-titlebar-left">
+          <span class="ds-title">Usage Monitor</span>
+          <span class="ds-title-models">· DeepSeek</span>
+        </div>
+        <div class="ds-titlebar-actions">
+          <button class="ds-btn" id="ds-collapse-btn" title="收起/展开">${pos.collapsed ? '▶' : '▼'}</button>
+        </div>
       </div>
       <div class="ds-body" id="ds-body">
-        <div class="ds-no-data" id="ds-no-data">等待数据…</div>
-        <div id="ds-data-content" style="display:none;"></div>
+        <div class="ds-account-overview">
+          <div class="ds-acct-item">
+            <div class="ds-acct-label">余额</div>
+            <div class="ds-acct-value" id="ds-balance">—</div>
+            <div class="ds-acct-unit">CNY</div>
+          </div>
+          <div class="ds-acct-item">
+            <div class="ds-acct-label">本月消费</div>
+            <div class="ds-acct-value" id="ds-monthly-cost">—</div>
+            <div class="ds-acct-unit">CNY</div>
+          </div>
+          <div class="ds-acct-item">
+            <div class="ds-acct-label">今日消费</div>
+            <div class="ds-acct-value accent" id="ds-today-cost">—</div>
+            <div class="ds-acct-unit">CNY</div>
+          </div>
+        </div>
+        <div class="ds-section-gap"></div>
+        <div class="ds-model-section" id="ds-model-section">
+          <div class="ds-no-data" id="ds-no-data">等待数据…</div>
+        </div>
       </div>
-      <div class="ds-statusbar" id="ds-statusbar"></div>
+      <div class="ds-summary-bar" id="ds-summary-bar" style="display:none;">
+        <span>总 Token <span class="ds-sum-val" id="ds-sum-tokens">—</span></span>
+        <span class="ds-summary-dot"></span>
+        <span>总请求 <span class="ds-sum-val" id="ds-sum-requests">—</span></span>
+        <span class="ds-summary-dot"></span>
+        <span>命中率 <span class="ds-sum-val" id="ds-sum-hitrate">—</span></span>
+      </div>
     `;
     document.body.appendChild(panel);
 
-    panelDataEl = document.getElementById('ds-data-content');
+    if (pos.collapsed) {
+      panel.classList.add('ds-collapsed');
+    }
 
     if (lastPayload) {
       updatePanelData(lastPayload);
-      updateStatus(lastPayload);
-    }
-
-    if (pos.collapsed) {
-      panel.classList.add('ds-collapsed');
-      document.getElementById('ds-body').style.display = 'none';
+      updateSummaryBar(lastPayload);
     }
 
     // --- 拖拽 ---
@@ -496,20 +644,21 @@
       dragInfo = null;
       panel.style.transition = '';
       const rect = panel.getBoundingClientRect();
-      panelPos.top = rect.top;
-      panelPos.left = rect.left;
+      const w = rect.width;
+      panelPos.top = Math.max(0, Math.min(rect.top, window.innerHeight - 60));
+      panelPos.left = Math.max(-w + 40, Math.min(rect.left, window.innerWidth - 40));
       panelPos.right = null;
+      // 应用钳制后的位置
+      panel.style.top = panelPos.top + 'px';
+      panel.style.left = panelPos.left + 'px';
       savePanelPos(panelPos);
     });
 
     // --- 折叠/展开 ---
     const collapseBtn = document.getElementById('ds-collapse-btn');
-    const bodyEl = document.getElementById('ds-body');
-
     collapseBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       const collapsed = panel.classList.toggle('ds-collapsed');
-      bodyEl.style.display = collapsed ? 'none' : '';
       collapseBtn.textContent = collapsed ? '▶' : '▼';
       panelPos.collapsed = collapsed;
       savePanelPos(panelPos);
@@ -531,139 +680,195 @@
   // ============================================================
 
   function updatePanelData(payload) {
-    if (!panelDataEl) {
+    const modelSection = document.getElementById('ds-model-section');
+    const noDataEl = document.getElementById('ds-no-data');
+    const todayCostEl = document.getElementById('ds-today-cost');
+    const monthlyCostEl = document.getElementById('ds-monthly-cost');
+    const balanceEl = document.getElementById('ds-balance');
+
+    if (!modelSection) {
       lastPayload = payload;
       return;
     }
 
-    const noDataEl = document.getElementById('ds-no-data');
     if (!payload || !payload.timestamp) {
       if (noDataEl) noDataEl.style.display = '';
-      panelDataEl.style.display = 'none';
       return;
     }
 
-    if (noDataEl) noDataEl.style.display = 'none';
-    panelDataEl.style.display = '';
-    panelDataEl.innerHTML = '';
-
+    // 账户概览
     const balance = payload.balance || {};
     const monthly = payload.monthly_consumption || {};
     const todayCost = payload.today_cost || {};
+    const currency = balance.currency || 'CNY';
+
+    if (todayCostEl) todayCostEl.textContent = fmtMoney(todayCost.amount);
+    if (monthlyCostEl) monthlyCostEl.textContent = fmtMoney(monthly.amount);
+    if (balanceEl) balanceEl.textContent = fmtMoney(balance.total);
+
+    // 更新单位
+    const units = document.querySelectorAll('.ds-acct-unit');
+    units.forEach(u => { u.textContent = currency; });
+
+    // 模型数据
+    if (noDataEl) noDataEl.style.display = 'none';
+
+    // 清除旧模型块（保留 no-data 元素）
+    const existingBlocks = modelSection.querySelectorAll('.ds-model-block');
+    existingBlocks.forEach(b => b.remove());
+
     const models = payload.models || {};
-    const ts = payload.timestamp ? new Date(payload.timestamp).toLocaleTimeString('zh-CN', { hour12: false }) : '—';
-
-    // 账户余额 标题行
-    const titleRow = document.createElement('div');
-    titleRow.className = 'ds-row';
-    const titleSpan = document.createElement('span');
-    titleSpan.className = 'ds-section-title';
-    titleSpan.style.cssText = 'border-bottom:none;margin:0;';
-    titleSpan.textContent = '账户余额';
-    const timeSpan = document.createElement('span');
-    timeSpan.style.cssText = 'font-weight:normal;color:#666;font-size:10px;flex-shrink:0;';
-    timeSpan.textContent = ts;
-    titleRow.appendChild(titleSpan);
-    titleRow.appendChild(timeSpan);
-    panelDataEl.appendChild(titleRow);
-
-    // 余额行
-    panelDataEl.appendChild(makeLabelValueRow('充值余额', document.createTextNode(fmtMoney(balance.total))));
-    panelDataEl.appendChild(makeLabelValueRow('本月消费', document.createTextNode(fmtMoney(monthly.amount))));
-    panelDataEl.appendChild(makeLabelValueRow('今日消费', document.createTextNode(fmtMoney(todayCost.amount))));
-
-    // 各模型
     const modelNames = Object.keys(models);
-    if (modelNames.length > 0) {
-      const hr = document.createElement('hr');
-      hr.className = 'ds-divider';
-      panelDataEl.appendChild(hr);
 
-      for (const name of modelNames) {
-        const m = models[name];
-        const mLower = name.toLowerCase();
-        let shortName = name;
-        if (mLower.includes('flash')) shortName = 'deepseek-v4-Flash';
-        else if (mLower.includes('pro')) shortName = 'deepseek-v4-pro';
+    if (modelNames.length === 0) {
+      if (noDataEl) noDataEl.style.display = '';
+      return;
+    }
 
-        const block = document.createElement('div');
-        block.className = 'ds-model-block';
+    for (const name of modelNames) {
+      const m = models[name];
+      const mLower = name.toLowerCase();
+      let shortName = name;
+      if (mLower.includes('flash')) shortName = 'deepseek-v4-flash';
+      else if (mLower.includes('pro')) shortName = 'deepseek-v4-pro';
 
-        const nameDiv = document.createElement('div');
-        nameDiv.className = 'ds-model-name';
-        nameDiv.textContent = shortName;
-        block.appendChild(nameDiv);
+      const block = document.createElement('div');
+      block.className = 'ds-model-block';
 
-        // 请求数
-        block.appendChild(makeLabelValueRow('请求数', makeToggleValue(m.requests)));
+      // 模型名
+      const modelRow = document.createElement('div');
+      modelRow.className = 'ds-model-row';
+      const nameSpan = document.createElement('span');
+      nameSpan.className = 'ds-model-id';
+      nameSpan.textContent = shortName;
+      modelRow.appendChild(nameSpan);
+      block.appendChild(modelRow);
 
-        if (m.tokens) {
-          block.appendChild(makeLabelValueRow('总Token', makeToggleValue(m.tokens.total)));
-          block.appendChild(makeIndentRow('命中缓存', makeToggleValue(m.tokens.cached_input)));
-          block.appendChild(makeIndentRow('未命中', makeToggleValue(m.tokens.uncached_input)));
-          block.appendChild(makeIndentRow('输出', makeToggleValue(m.tokens.output)));
-        }
+      // 模型名下方分隔线
+      const modelSep = document.createElement('div');
+      modelSep.className = 'ds-model-sep';
+      block.appendChild(modelSep);
 
-        const hitVal = document.createElement('span');
-        hitVal.className = 'ds-value';
-        hitVal.textContent = fmtPercent(m.cache_hit_rate);
-        block.appendChild(makeLabelValueRow('缓存命中率', hitVal));
+      // 指标网格 — 第1行: Total, Cost, Requests; 第2行: Cached, Uncached, Output
+      const metricsGrid = document.createElement('div');
+      metricsGrid.className = 'ds-metrics';
 
-        panelDataEl.appendChild(block);
+      const tokens = m.tokens || {};
+      const costVal = m.cost !== undefined ? '¥' + m.cost.toFixed(2) : '—';
+
+      // 行1: Total, Cost, Requests
+      metricsGrid.appendChild(makeToggleMetric(tokens.total, 'Total'));
+      metricsGrid.appendChild(makeToggleMetric(m.cost, 'Cost', '', true));
+      metricsGrid.appendChild(makeToggleMetric(m.requests, 'Requests'));
+
+      // 行2: Cached, Uncached, Output
+      metricsGrid.appendChild(makeToggleMetric(tokens.cached_input, 'Cached', 'green'));
+      metricsGrid.appendChild(makeToggleMetric(tokens.uncached_input, 'Uncached'));
+      metricsGrid.appendChild(makeToggleMetric(tokens.output, 'Output'));
+
+      block.appendChild(metricsGrid);
+
+      // 缓存命中条
+      if (m.cache_hit_rate !== null && m.cache_hit_rate !== undefined) {
+        const cacheRow = document.createElement('div');
+        cacheRow.className = 'ds-cache-row';
+
+        const cacheLabel = document.createElement('span');
+        cacheLabel.className = 'ds-cache-label';
+        cacheLabel.textContent = 'Cache Hit';
+
+        const cacheTrack = document.createElement('div');
+        cacheTrack.className = 'ds-cache-track';
+        const cacheFill = document.createElement('div');
+        cacheFill.className = 'ds-cache-fill';
+        cacheFill.style.width = Math.min(100, Math.max(0, m.cache_hit_rate)) + '%';
+        cacheTrack.appendChild(cacheFill);
+
+        const cachePct = document.createElement('span');
+        cachePct.className = 'ds-cache-pct';
+        cachePct.textContent = fmtPercent(m.cache_hit_rate);
+
+        cacheRow.appendChild(cacheLabel);
+        cacheRow.appendChild(cacheTrack);
+        cacheRow.appendChild(cachePct);
+        block.appendChild(cacheRow);
       }
+
+      modelSection.appendChild(block);
     }
   }
 
-  function makeLabelValueRow(labelText, valueEl) {
-    const row = document.createElement('div');
-    row.className = 'ds-row';
+  function makeToggleMetric(n, labelText, extraClass, isMoney) {
+    const metric = document.createElement('div');
+    metric.className = 'ds-metric';
+
+    const val = document.createElement('span');
+    val.className = 'ds-metric-val';
+    if (extraClass) val.classList.add(extraClass);
+
+    if (n !== undefined && n !== null && typeof n === 'number') {
+      if (isMoney) {
+        val.textContent = '¥' + n.toFixed(2);
+      } else {
+        val.setAttribute('data-short', fmtNumShort(n));
+        val.setAttribute('data-raw', fmtNumRaw(n));
+        val.textContent = fmtNumShort(n);
+        val.style.cursor = 'pointer';
+        val.title = '点击查看原始数字';
+      }
+    } else {
+      val.textContent = '—';
+    }
+
     const lbl = document.createElement('span');
-    lbl.className = 'ds-label';
+    lbl.className = 'ds-metric-lbl';
     lbl.textContent = labelText;
-    if (valueEl.className !== 'ds-value') valueEl.className = 'ds-value';
-    row.appendChild(lbl);
-    row.appendChild(valueEl);
-    return row;
+
+    metric.appendChild(val);
+    metric.appendChild(lbl);
+    return metric;
   }
 
-  function makeIndentRow(labelText, valueEl) {
-    const row = document.createElement('div');
-    row.className = 'ds-row';
-    const lbl = document.createElement('span');
-    lbl.className = 'ds-label';
-    lbl.style.cssText = 'padding-left:8px;color:#888;';
-    lbl.textContent = labelText;
-    if (valueEl.className === 'ds-value') valueEl.style.color = '#aaa';
-    else { valueEl.className = 'ds-value'; valueEl.style.color = '#aaa'; }
-    row.appendChild(lbl);
-    row.appendChild(valueEl);
-    return row;
-  }
+  function updateSummaryBar(payload) {
+    const bar = document.getElementById('ds-summary-bar');
+    const sumTokens = document.getElementById('ds-sum-tokens');
+    const sumRequests = document.getElementById('ds-sum-requests');
+    const sumHitrate = document.getElementById('ds-sum-hitrate');
 
-  function updateStatus(payload) {
-    const el = document.getElementById('ds-statusbar');
-    if (!el) return;
-    const totalRequests = Object.values(payload.models || {}).reduce((s, m) => s + (m.requests || 0), 0);
-    const totalTokens = Object.values(payload.models || {}).reduce((s, m) => s + (m.tokens ? m.tokens.total : 0), 0);
+    if (!bar || !payload) return;
 
-    el.innerHTML = '';
-    const tokenLabel = document.createElement('span');
-    tokenLabel.style.cssText = 'color:#aaa;';
-    tokenLabel.textContent = '总Token:';
-    el.appendChild(tokenLabel);
-    el.appendChild(makeToggleValue(totalTokens));
-    const sep = document.createElement('span');
-    sep.style.cssText = 'color:#555;margin:0 6px;';
-    sep.textContent = '|';
-    el.appendChild(sep);
-    const reqLabel = document.createElement('span');
-    reqLabel.style.cssText = 'color:#aaa;';
-    reqLabel.textContent = '总请求:';
-    el.appendChild(reqLabel);
-    const reqVal = document.createElement('span');
-    reqVal.className = 'ds-value';
-    reqVal.textContent = totalRequests.toLocaleString() + ' 次';
-    el.appendChild(reqVal);
+    const models = payload.models || {};
+    const modelNames = Object.keys(models);
+
+    if (modelNames.length === 0) {
+      bar.style.display = 'none';
+      return;
+    }
+
+    bar.style.display = '';
+
+    let totalTokens = 0;
+    let totalRequests = 0;
+    let totalCached = 0;
+    let totalInput = 0;
+
+    for (const name of modelNames) {
+      const m = models[name];
+      totalRequests += m.requests || 0;
+      if (m.tokens) {
+        totalTokens += m.tokens.total || 0;
+        totalCached += m.tokens.cached_input || 0;
+        totalInput += (m.tokens.cached_input || 0) + (m.tokens.uncached_input || 0);
+      }
+    }
+
+    const overallHitRate = totalInput > 0
+      ? Math.round((totalCached / totalInput) * 1000) / 10
+      : null;
+
+    if (sumTokens) sumTokens.textContent = fmtNumShort(totalTokens);
+    if (sumRequests) sumRequests.textContent = totalRequests.toLocaleString();
+    if (sumHitrate) sumHitrate.textContent = overallHitRate !== null ? fmtPercent(overallHitRate) : '—';
   }
 
   // ============================================================
