@@ -529,6 +529,19 @@
     .ds-calendar-day.has-data { background: rgba(137, 180, 250, 0.2); border-radius: 4px; font-weight: 600; }
     .ds-calendar-day.selected { background: #89b4fa; color: #1e1e2e; border-radius: 4px; }
     .ds-calendar-day:hover { background: rgba(137, 180, 250, 0.4); border-radius: 4px; }
+    .ds-calendar-day.today { box-shadow: inset 0 0 0 1.5px #89b4fa; }
+    .ds-calendar-cost { display: block; font-size: 8px; line-height: 1.1; opacity: 0.65; margin-top: 0px; }
+    .ds-calendar-today-btn { font-size: 11px; color: #89b4fa; cursor: pointer; background: none; border: none; padding: 2px 6px; border-radius: 3px; }
+    .ds-calendar-today-btn:hover { background: rgba(137, 180, 250, 0.2); }
+    .ds-calendar-tooltip { position: absolute; display: none; background: rgba(30,30,46,0.96); border: 1px solid rgba(255,255,255,0.15); border-radius: 8px; padding: 6px 10px; font-size: 11px; line-height: 1.5; z-index: 100001; pointer-events: none; box-shadow: 0 4px 14px rgba(0,0,0,0.4); white-space: nowrap; }
+    .ds-calendar-tooltip .ds-tt-row { display: flex; justify-content: space-between; gap: 12px; }
+    .ds-calendar-tooltip .ds-tt-label { opacity: 0.6; }
+    .ds-calendar-tooltip .ds-tt-val { font-weight: 600; }
+    .ds-calendar-summary { margin-top: 6px; padding: 5px 4px 2px; border-top: 1px solid rgba(255,255,255,0.08); font-size: 10px; display: flex; flex-wrap: wrap; gap: 8px; opacity: 0.7; }
+    .ds-calendar-summary b { opacity: 0.9; }
+    @keyframes ds-calendar-in { from { opacity: 0; transform: scale(0.96) translateY(-4px); } to { opacity: 1; transform: scale(1) translateY(0); } }
+    .ds-calendar { animation: ds-calendar-in 0.15s ease-out; }
+    .ds-calendar-day { transition: background 0.12s, color 0.12s, transform 0.12s; }
   `;
 
   const lightThemeStyle = `
@@ -575,6 +588,19 @@
     .ds-calendar-day.has-data { background: rgba(30, 102, 245, 0.15); border-radius: 4px; font-weight: 600; }
     .ds-calendar-day.selected { background: #1e66f5; color: #ffffff; border-radius: 4px; }
     .ds-calendar-day:hover { background: rgba(30, 102, 245, 0.3); border-radius: 4px; }
+    .ds-calendar-day.today { box-shadow: inset 0 0 0 1.5px #1e66f5; }
+    .ds-calendar-cost { display: block; font-size: 8px; line-height: 1.1; opacity: 0.6; margin-top: 0px; }
+    .ds-calendar-today-btn { font-size: 11px; color: #1e66f5; cursor: pointer; background: none; border: none; padding: 2px 6px; border-radius: 3px; }
+    .ds-calendar-today-btn:hover { background: rgba(30, 102, 245, 0.12); }
+    .ds-calendar-tooltip { position: absolute; display: none; background: rgba(245,245,250,0.97); border: 1px solid rgba(0,0,0,0.12); border-radius: 8px; padding: 6px 10px; font-size: 11px; line-height: 1.5; z-index: 100001; pointer-events: none; box-shadow: 0 4px 14px rgba(0,0,0,0.12); white-space: nowrap; }
+    .ds-calendar-tooltip .ds-tt-row { display: flex; justify-content: space-between; gap: 12px; }
+    .ds-calendar-tooltip .ds-tt-label { opacity: 0.55; }
+    .ds-calendar-tooltip .ds-tt-val { font-weight: 600; }
+    .ds-calendar-summary { margin-top: 6px; padding: 5px 4px 2px; border-top: 1px solid rgba(0,0,0,0.08); font-size: 10px; display: flex; flex-wrap: wrap; gap: 8px; opacity: 0.65; }
+    .ds-calendar-summary b { opacity: 0.85; }
+    @keyframes ds-calendar-in { from { opacity: 0; transform: scale(0.96) translateY(-4px); } to { opacity: 1; transform: scale(1) translateY(0); } }
+    .ds-calendar { animation: ds-calendar-in 0.15s ease-out; }
+    .ds-calendar-day { transition: background 0.12s, color 0.12s, transform 0.12s; }
   `;
 
   let currentTheme = 'dark';
@@ -713,7 +739,7 @@
         const cell = days[i + j];
         const td = document.createElement('td');
         td.style.textAlign = 'center';
-        td.style.padding = '4px 0';
+        td.style.padding = '2px 0';
         const daySpan = document.createElement('span');
         daySpan.textContent = cell.date.getDate();
         daySpan.className = 'ds-calendar-day';
@@ -724,6 +750,9 @@
         }
         if (selectedDate === dateStr && cell.isCurrentMonth) {
           daySpan.classList.add('selected');
+        }
+        if (dateStr === utcToday() && cell.isCurrentMonth) {
+          daySpan.classList.add('today');
         }
         daySpan.style.cursor = 'pointer';
         daySpan.style.display = 'inline-block';
@@ -738,12 +767,89 @@
           }
         });
         td.appendChild(daySpan);
+        if (cell.isCurrentMonth && dailyDataMap.has(dateStr)) {
+          const dayData = dailyDataMap.get(dateStr);
+          const costEl = document.createElement('span');
+          costEl.className = 'ds-calendar-cost';
+          const amt = dayData.totalCost || 0;
+          costEl.textContent = amt < 100 ? amt.toFixed(1) : Math.round(amt).toString();
+          td.appendChild(costEl);
+          daySpan.addEventListener('mouseenter', (e) => { showCalendarTooltip(e, dayData); });
+          daySpan.addEventListener('mouseleave', () => { hideCalendarTooltip(); });
+        }
         row.appendChild(td);
       }
       tbody.appendChild(row);
     }
     table.appendChild(tbody);
     container.appendChild(table);
+  }
+
+  let calendarTooltip = null;
+
+  function showCalendarTooltip(event, dayData) {
+    const overlay = calendarOverlay;
+    if (!overlay) return;
+    if (!calendarTooltip) {
+      calendarTooltip = document.createElement('div');
+      calendarTooltip.id = 'ds-calendar-tooltip';
+      calendarTooltip.className = 'ds-calendar-tooltip';
+      overlay.appendChild(calendarTooltip);
+    }
+    const cost = dayData.totalCost || 0;
+    const tokens = dayData.totalTokens || 0;
+    const requests = dayData.totalRequests || 0;
+    const hitRate = dayData.overallHitRate;
+    calendarTooltip.innerHTML =
+      '<div class="ds-tt-row"><span class="ds-tt-label">费用</span><span class="ds-tt-val">' + fmtMoney(cost) + '</span></div>' +
+      '<div class="ds-tt-row"><span class="ds-tt-label">Token</span><span class="ds-tt-val">' + fmtNumShort(tokens) + '</span></div>' +
+      '<div class="ds-tt-row"><span class="ds-tt-label">请求</span><span class="ds-tt-val">' + requests.toLocaleString() + '</span></div>' +
+      '<div class="ds-tt-row"><span class="ds-tt-label">缓存命中</span><span class="ds-tt-val">' + (hitRate !== null ? hitRate.toFixed(0) + '%' : '—') + '</span></div>';
+    calendarTooltip.style.display = 'block';
+
+    const cell = event.target;
+    const cellRect = cell.getBoundingClientRect();
+    const overlayRect = overlay.getBoundingClientRect();
+    const ttHeight = calendarTooltip.offsetHeight || 60;
+    const ttWidth = calendarTooltip.offsetWidth || 140;
+
+    let top = cellRect.top - overlayRect.top - ttHeight - 4;
+    if (top < 4) {
+      top = cellRect.bottom - overlayRect.top + 4;
+    }
+    let left = cellRect.left - overlayRect.left + cellRect.width / 2;
+    left = Math.max(4, Math.min(left, overlayRect.width - ttWidth - 4));
+
+    calendarTooltip.style.top = top + 'px';
+    calendarTooltip.style.left = left + 'px';
+    calendarTooltip.style.transform = 'translateX(-50%)';
+  }
+
+  function hideCalendarTooltip() {
+    if (calendarTooltip) calendarTooltip.style.display = 'none';
+  }
+
+  function buildMonthlySummary(year, month) {
+    let totalCost = 0, totalTokens = 0, totalRequests = 0, dayCount = 0;
+    for (const [dateStr, dayData] of dailyDataMap.entries()) {
+      const parts = dateStr.split('-');
+      if (parseInt(parts[0]) === year && parseInt(parts[1]) - 1 === month) {
+        totalCost += dayData.totalCost || 0;
+        totalTokens += dayData.totalTokens || 0;
+        totalRequests += dayData.totalRequests || 0;
+        dayCount++;
+      }
+    }
+    const div = document.createElement('div');
+    div.className = 'ds-calendar-summary';
+    const unit = rawUserSummary && rawUserSummary.balance && rawUserSummary.balance.currency === 'CNY' ? '¥' : '$';
+    div.innerHTML =
+      '<span>(' + (month + 1) + '月) 合计</span>' +
+      '<span>费用 <b>' + unit + totalCost.toFixed(2) + '</b></span>' +
+      '<span>Token <b>' + fmtNumShort(totalTokens) + '</b></span>' +
+      '<span>请求 <b>' + totalRequests.toLocaleString() + '</b></span>' +
+      '<span>天数 ' + dayCount + '</span>';
+    return div;
   }
 
   function createCalendarOverlay() {
@@ -755,10 +861,13 @@
       z-index: 100000;
       background: inherit;
       border-radius: 12px;
-      box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+      box-shadow: 0 12px 32px rgba(0,0,0,0.35);
       padding: 12px;
-      min-width: 280px;
+      min-width: 296px;
       font-family: inherit;
+      max-height: 80vh;
+      overflow-y: auto;
+      overscroll-behavior: contain;
     `;
     overlay.className = 'ds-calendar';
     document.body.appendChild(overlay);
@@ -820,7 +929,23 @@
       }
       renderCalendarContent();
     });
-    header.appendChild(prevBtn);
+    const leftGroup = document.createElement('div');
+    leftGroup.style.display = 'flex';
+    leftGroup.style.alignItems = 'center';
+    leftGroup.style.gap = '2px';
+    leftGroup.appendChild(prevBtn);
+    const todayBtn = document.createElement('button');
+    todayBtn.textContent = '今天';
+    todayBtn.className = 'ds-calendar-today-btn';
+    todayBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const now = new Date();
+      currentCalendarYear = now.getFullYear();
+      currentCalendarMonth = now.getMonth();
+      renderCalendarContent();
+    });
+    leftGroup.appendChild(todayBtn);
+    header.appendChild(leftGroup);
     header.appendChild(monthYear);
     header.appendChild(nextBtn);
     calendarOverlay.appendChild(header);
@@ -831,6 +956,8 @@
       calendarContainer.innerHTML = '';
       updateMonthYear();
       renderCalendar(calendarContainer, currentCalendarYear, currentCalendarMonth);
+      const summary = buildMonthlySummary(currentCalendarYear, currentCalendarMonth);
+      calendarContainer.appendChild(summary);
     };
     renderCalendarContent();
   }
