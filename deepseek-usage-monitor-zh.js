@@ -2,7 +2,7 @@
 // ==UserScript==
 // @name         DeepSeek 每日用量监控
 // @namespace    https://github.com/local/deepseek-usage-monitor
-// @version      1.4.1
+// @version      1.5.0
 // @description  拦截 DeepSeek 开放平台用量 API，在小窗口中展示完整数据，支持日历查看历史每日用量（纯本地，无远程通信）
 // @author       minhua-cheng
 // @match        https://platform.deepseek.com/usage*
@@ -21,6 +21,13 @@
   let rawUserSummary = null;
   let rawUsageAmount = null;
   let rawUsageCost = null;
+  let rawUsageAmountMonthKey = null;
+  let rawUsageCostMonthKey = null;
+  let pendingCalendarMonthKey = null;
+  let usageAmountByMonth = new Map();
+  let usageCostByMonth = new Map();
+  let usageRequestUrls = { usage_amount: null, usage_cost: null };
+  let usageBackgroundInFlight = new Set();
 
   // 每日数据缓存 (合并 amount 和 cost)
   // 结构: Map<dateString, { models: { modelName: { tokens, cost, requests, cache_hit_rate } }, totalTokens, totalCost, totalRequests, overallHitRate }>
@@ -53,8 +60,137 @@
     return localDateStr(d);
   }
 
+  function monthKey(year, month) {
+    return year + '-' + (month + 1);
+  }
+
+  function parseMonthKey(value) {
+    const match = String(value || '').match(/^(\d{4})-(\d{1,2})$/);
+    if (!match) return null;
+    const year = parseInt(match[1], 10);
+    const month = parseInt(match[2], 10) - 1;
+    if (!Number.isFinite(year) || month < 0 || month > 11) return null;
+    return { year, month, key: monthKey(year, month) };
+  }
+
+  function addMonths(year, month, delta) {
+    const d = new Date(year, month + delta, 1);
+    return { year: d.getFullYear(), month: d.getMonth(), key: monthKey(d.getFullYear(), d.getMonth()) };
+  }
+
+  function compareMonthInfo(a, b) {
+    return (a.year - b.year) || (a.month - b.month);
+  }
+
+  function formatDateUTC(year, month, day) {
+    return year + '-' + String(month + 1).padStart(2, '0') + '-' + String(day).padStart(2, '0');
+  }
+
+  function monthLastDay(year, month) {
+    return new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+  }
+
+  function getBizDataMonthKey(bizData) {
+    if (!bizData || !Array.isArray(bizData.days) || bizData.days.length === 0) return null;
+    for (const day of bizData.days) {
+      if (day && day.date) {
+        const parts = String(day.date).split('-');
+        if (parts.length >= 2) {
+          return parseInt(parts[0], 10) + '-' + parseInt(parts[1], 10);
+        }
+      }
+    }
+    return null;
+  }
+
+  function getRequestMonthKey(url) {
+    try {
+      const parsedUrl = new URL(url, window.location.origin);
+      const params = parsedUrl.searchParams;
+      const directMonth = params.get('month') || params.get('date');
+      const directParsed = parseMonthKey(directMonth);
+      if (directParsed) return directParsed.key;
+      const directDate = directMonth && String(directMonth).match(/^(\d{4})-(\d{1,2})/);
+      if (directDate) return parseInt(directDate[1], 10) + '-' + parseInt(directDate[2], 10);
+
+      const year = params.get('year');
+      const month = params.get('month');
+      if (year && month) {
+        const parsed = parseMonthKey(year + '-' + month);
+        if (parsed) return parsed.key;
+      }
+
+      const dateKeys = ['start', 'start_date', 'begin', 'begin_date', 'from', 'from_date', 'end', 'end_date', 'to', 'to_date'];
+      for (const key of dateKeys) {
+        const value = params.get(key);
+        const match = value && String(value).match(/^(\d{4})-(\d{1,2})/);
+        if (match) return parseInt(match[1], 10) + '-' + parseInt(match[2], 10);
+      }
+    } catch { /* 忽略 */ }
+    return null;
+  }
+
+  function buildUsageMonthUrl(templateUrl, year, month) {
+    if (!templateUrl) return null;
+    const targetKey = monthKey(year, month);
+    const firstDate = formatDateUTC(year, month, 1);
+    const lastDate = formatDateUTC(year, month, monthLastDay(year, month));
+    try {
+      const parsedUrl = new URL(templateUrl, window.location.origin);
+      const params = parsedUrl.searchParams;
+      let changed = false;
+
+      if (params.has('year')) {
+        params.set('year', String(year));
+        changed = true;
+      }
+      if (params.has('month')) {
+        const oldMonth = params.get('month') || '';
+        if (/^\d{4}-\d{1,2}$/.test(oldMonth)) {
+          const oldParts = oldMonth.split('-');
+          params.set('month', year + '-' + (oldParts[1].length === 2 ? String(month + 1).padStart(2, '0') : String(month + 1)));
+        } else {
+          params.set('month', oldMonth.length === 2 ? String(month + 1).padStart(2, '0') : String(month + 1));
+        }
+        changed = true;
+      }
+      if (params.has('date')) {
+        const oldDate = params.get('date') || '';
+        params.set('date', oldDate.length <= 7 ? targetKey : firstDate);
+        changed = true;
+      }
+
+      const startKeys = ['start', 'start_date', 'begin', 'begin_date', 'from', 'from_date'];
+      const endKeys = ['end', 'end_date', 'to', 'to_date'];
+      for (const key of startKeys) {
+        if (params.has(key)) {
+          params.set(key, firstDate);
+          changed = true;
+        }
+      }
+      for (const key of endKeys) {
+        if (params.has(key)) {
+          params.set(key, lastDate);
+          changed = true;
+        }
+      }
+      if (changed) return parsedUrl.toString();
+    } catch { /* 忽略 */ }
+
+    const replaced = String(templateUrl).replace(/\d{4}-\d{1,2}(?:-\d{1,2})?/, function(match) {
+      return match.length > 7 ? firstDate : targetKey;
+    });
+    return replaced !== String(templateUrl) ? replaced : null;
+  }
+
   function safeJSON(text) {
     try { return JSON.parse(text); } catch { return null; }
+  }
+
+  function escapeHTML(value) {
+    return String(value).replace(/[&<>"']/g, function(ch) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch];
+    });
   }
 
   function log(msg) {
@@ -224,13 +360,17 @@
       ? transformUserSummary(rawUserSummary)
       : { balance: { total: 0, normal_wallet_balance: 0, bonus_wallet_balance: 0, currency: 'CNY' }, monthly_consumption: { amount: 0, currency: 'CNY' } };
 
+    const pageMonth = getSelectedPageMonth();
+    const targetMonthKey = pageMonth
+      ? pageMonth.key
+      : (rawUsageAmountMonthKey || rawUsageCostMonthKey);
     let usageData = { today_date: utcToday(), models: {} };
-    if (rawUsageAmount) {
+    if (rawUsageAmount && (!targetMonthKey || rawUsageAmountMonthKey === targetMonthKey)) {
       usageData = transformUsageAmount(rawUsageAmount);
     }
 
     let costData = { today_cost: { amount: 0, currency: 'CNY' } };
-    if (rawUsageCost) {
+    if (rawUsageCost && (!targetMonthKey || rawUsageCostMonthKey === targetMonthKey)) {
       costData = transformUsageCost(rawUsageCost);
     }
 
@@ -256,14 +396,15 @@
   // ============================================================
 
   // 从 amount 数据更新每日数据（只关注选定模型）
-  function updateDailyDataFromAmount(bizData) {
+  function updateDailyDataFromAmount(bizData, targetMap) {
     if (!bizData || !bizData.days) return;
+    const map = targetMap || dailyDataMap;
     for (const day of bizData.days) {
       const date = day.date;
-      if (!dailyDataMap.has(date)) {
-        dailyDataMap.set(date, { models: {}, totalTokens: 0, totalCost: 0, totalRequests: 0, overallHitRate: null });
+      if (!map.has(date)) {
+        map.set(date, { models: {}, totalTokens: 0, totalCost: 0, totalRequests: 0, overallHitRate: null });
       }
-      const dayData = dailyDataMap.get(date);
+      const dayData = map.get(date);
       for (const entry of day.data) {
         if (!entry.model) continue;
         const modelLower = entry.model.toLowerCase();
@@ -285,15 +426,16 @@
   }
 
   // 从 cost 数据更新每日数据（补充费用信息）
-  function updateDailyDataFromCost(bizData) {
+  function updateDailyDataFromCost(bizData, targetMap) {
     if (!bizData || !bizData.days) return;
+    const map = targetMap || dailyDataMap;
     const currency = bizData.currency || 'CNY';
     for (const day of bizData.days) {
       const date = day.date;
-      if (!dailyDataMap.has(date)) {
-        dailyDataMap.set(date, { models: {}, totalTokens: 0, totalCost: 0, totalRequests: 0, overallHitRate: null });
+      if (!map.has(date)) {
+        map.set(date, { models: {}, totalTokens: 0, totalCost: 0, totalRequests: 0, overallHitRate: null });
       }
-      const dayData = dailyDataMap.get(date);
+      const dayData = map.get(date);
       let dayCost = 0;
       for (const entry of day.data) {
         if (!entry.usage) continue;
@@ -319,12 +461,9 @@
   }
 
   // 综合更新每日数据缓存
-  function rebuildDailyData() {
-    dailyDataMap.clear();
-    if (rawUsageAmount) updateDailyDataFromAmount(rawUsageAmount);
-    if (rawUsageCost) updateDailyDataFromCost(rawUsageCost);
+  function recalcDailyHitRates(targetMap) {
     // 重新计算每条记录的总体命中率（基于模型的总输入）
-    for (const [date, dayData] of dailyDataMap.entries()) {
+    for (const [date, dayData] of targetMap.entries()) {
       let totalCached = 0, totalInput = 0;
       for (const model of Object.values(dayData.models)) {
         if (model.tokens) {
@@ -334,6 +473,35 @@
       }
       dayData.overallHitRate = totalInput > 0 ? (totalCached / totalInput) * 100 : null;
     }
+  }
+
+  function rebuildDailyData() {
+    dailyDataMap.clear();
+    const pageMonth = getSelectedPageMonth();
+    const targetMonthKey = pageMonth
+      ? pageMonth.key
+      : (rawUsageAmountMonthKey || rawUsageCostMonthKey);
+    const amountData = targetMonthKey ? (usageAmountByMonth.get(targetMonthKey) || rawUsageAmount) : rawUsageAmount;
+    const costData = targetMonthKey ? (usageCostByMonth.get(targetMonthKey) || rawUsageCost) : rawUsageCost;
+    if (amountData && (!targetMonthKey || (usageAmountByMonth.has(targetMonthKey) || rawUsageAmountMonthKey === targetMonthKey))) {
+      updateDailyDataFromAmount(amountData);
+    }
+    if (costData && (!targetMonthKey || (usageCostByMonth.has(targetMonthKey) || rawUsageCostMonthKey === targetMonthKey))) {
+      updateDailyDataFromCost(costData);
+    }
+    recalcDailyHitRates(dailyDataMap);
+  }
+
+  function buildDailyDataForMonthKeys(monthKeys) {
+    const map = new Map();
+    for (const key of monthKeys) {
+      const amountData = usageAmountByMonth.get(key);
+      const costData = usageCostByMonth.get(key);
+      if (amountData) updateDailyDataFromAmount(amountData, map);
+      if (costData) updateDailyDataFromCost(costData, map);
+    }
+    recalcDailyHitRates(map);
+    return map;
   }
 
   // ============================================================
@@ -363,6 +531,9 @@
     const ep = matchEndpoint(method, url);
 
     if (ep) {
+      if (ep.id === 'usage_amount' || ep.id === 'usage_cost') {
+        usageRequestUrls[ep.id] = url;
+      }
       const req = input instanceof Request ? input : { headers: init && init.headers };
       if (!bearerToken) {
         const auth = findAuthHeader(req);
@@ -376,7 +547,7 @@
           const cloned = response.clone();
           const json = await cloned.json();
           const bizData = extractBizData(json);
-          if (bizData) processApiResponse(ep.id, bizData);
+          if (bizData) processApiResponse(ep.id, bizData, getRequestMonthKey(url));
         } catch (e) { /* 忽略 */ }
       }
       return response;
@@ -408,12 +579,15 @@
     const origSend = xhr.send;
     xhr.send = function (body) {
       const ep = matchEndpoint(_method, _url);
+      if (ep && (ep.id === 'usage_amount' || ep.id === 'usage_cost')) {
+        usageRequestUrls[ep.id] = _url;
+      }
       xhr.addEventListener('load', function () {
         if (ep && xhr.status >= 200 && xhr.status < 300) {
           const json = safeJSON(xhr.responseText);
           if (json) {
             const bizData = extractBizData(json);
-            if (bizData) processApiResponse(ep.id, bizData);
+            if (bizData) processApiResponse(ep.id, bizData, getRequestMonthKey(_url));
           }
         }
       });
@@ -426,22 +600,37 @@
   // ============================================================
   // 数据接收
   // ============================================================
-  function processApiResponse(endpoint, bizData) {
+  function processApiResponse(endpoint, bizData, requestMonthKey) {
+    const prevVisibleMonthKey = monthKey(currentCalendarYear, currentCalendarMonth);
     switch (endpoint) {
     case 'get_user_summary': rawUserSummary = bizData; break;
-    case 'usage_amount': rawUsageAmount = bizData; break;
-    case 'usage_cost': rawUsageCost = bizData; break;
+    case 'usage_amount':
+      rawUsageAmount = bizData;
+      rawUsageAmountMonthKey = getBizDataMonthKey(bizData) || requestMonthKey || (getSelectedPageMonth() && getSelectedPageMonth().key);
+      if (rawUsageAmountMonthKey) usageAmountByMonth.set(rawUsageAmountMonthKey, bizData);
+      break;
+    case 'usage_cost':
+      rawUsageCost = bizData;
+      rawUsageCostMonthKey = getBizDataMonthKey(bizData) || requestMonthKey || (getSelectedPageMonth() && getSelectedPageMonth().key);
+      if (rawUsageCostMonthKey) usageCostByMonth.set(rawUsageCostMonthKey, bizData);
+      break;
     }
     // 每次收到新数据，重新构建每日缓存
     rebuildDailyData();
     // 如果日历已打开，自动刷新为当前数据的月份
     if (calendarOverlay && calendarOverlay.style.display === 'block') {
       updateCalendarMonthFromData();
-      // 重置范围选择状态（月份变了，旧范围失效）
-      rangePhase = 'idle';
-      rangeStartDate = null;
-      rangeEndDate = null;
-      calendarCursorDate = null;
+      const nextVisibleMonthKey = monthKey(currentCalendarYear, currentCalendarMonth);
+      if (pendingCalendarMonthKey && calendarMonthDataReady()) {
+        pendingCalendarMonthKey = null;
+      }
+      if (prevVisibleMonthKey !== nextVisibleMonthKey) {
+        // 重置范围选择状态（月份变了，旧范围失效）
+        rangePhase = 'idle';
+        rangeStartDate = null;
+        rangeEndDate = null;
+        calendarCursorDate = null;
+      }
       if (calendarRefreshFn) calendarRefreshFn();
     }
     const payload = buildOutputPayload();
@@ -467,9 +656,29 @@
   function fmtNumShort(n) {
     if (n === undefined || n === null) return '—';
     if (typeof n === 'number') {
-      if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
-      if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
-      return n.toLocaleString();
+      const abs = Math.abs(n);
+      const units = [
+        { value: 1e9, suffix: 'B' },
+        { value: 1e6, suffix: 'M' },
+        { value: 1e3, suffix: 'K' },
+      ];
+      for (let i = 0; i < units.length; i++) {
+        const unit = units[i];
+        if (abs >= unit.value) {
+          let scaled = n / unit.value;
+          let precision = Math.abs(scaled) >= 100 ? 0 : (Math.abs(scaled) >= 10 ? 1 : 2);
+          let rounded = Number(scaled.toFixed(precision));
+          if (Math.abs(rounded) >= 1000 && i > 0) {
+            const nextUnit = units[i - 1];
+            scaled = n / nextUnit.value;
+            precision = Math.abs(scaled) >= 100 ? 0 : (Math.abs(scaled) >= 10 ? 1 : 2);
+            rounded = Number(scaled.toFixed(precision));
+            return rounded.toString() + nextUnit.suffix;
+          }
+          return rounded.toString() + unit.suffix;
+        }
+      }
+      return Math.round(n).toLocaleString();
     }
     return String(n);
   }
@@ -509,12 +718,12 @@
 
   const darkThemeStyle = `
     #ds-monitor-panel {
-      background: rgba(30, 30, 46, 0.92);
-      backdrop-filter: blur(24px);
-      -webkit-backdrop-filter: blur(24px);
-      border: 1px solid rgba(255,255,255,0.1);
-      color: #cdd6f4;
-      box-shadow: 0 12px 40px rgba(0,0,0,0.5), 0 0 0 0.5px rgba(255,255,255,0.05);
+      background: rgba(17, 17, 31, 0.92);
+      backdrop-filter: blur(28px);
+      -webkit-backdrop-filter: blur(28px);
+      border: 1px solid rgba(96, 165, 250, 0.12);
+      color: #e2e8f0;
+      box-shadow: 0 16px 48px rgba(0,0,0,0.5), 0 0 0 0.5px rgba(96,165,250,0.06), inset 0 1px 0 rgba(255,255,255,0.04);
     }
     .ds-titlebar { border-bottom: 1px solid rgba(255,255,255,0.06); }
     .ds-title { color: #e5e5e5; }
@@ -523,23 +732,23 @@
     .ds-btn:hover { background: rgba(255,255,255,0.08); color: #cdd6f4; }
     .ds-acct-label { color: #6c7086; }
     .ds-acct-value { color: #cdd6f4; }
-    .ds-acct-value.accent { background: linear-gradient(135deg, #89b4fa, #a6e3a1); -webkit-background-clip: text; background-clip: text; }
+    .ds-acct-value.accent { background: linear-gradient(135deg, #60a5fa, #34d399); -webkit-background-clip: text; background-clip: text; }
     .ds-acct-unit { color: #585b70; }
     .ds-section-gap { background: rgba(255,255,255,0.06); }
-    .ds-model-block { background: rgba(0,0,0,0.2); border: 1px solid rgba(255,255,255,0.04); }
+    .ds-model-block { background: rgba(15,15,30,0.5); border: 1px solid rgba(96,165,250,0.06); box-shadow: 0 2px 8px rgba(0,0,0,0.15); }
     .ds-model-id { color: #fab387; }
     .ds-model-sep { background: rgba(255,255,255,0.04); }
-    .ds-metric-val { color: #cdd6f4; }
-    .ds-metric-val.green { color: #a6e3a1; }
+    .ds-metric-val { color: #e2e8f0; }
+    .ds-metric-val.green { color: #34d399; }
     .ds-metric-val.yellow { color: #f9e2af; }
     .ds-metric-lbl { color: #6c7086; }
     .ds-cache-row { border-top: 1px solid rgba(255,255,255,0.04); }
     .ds-cache-label { color: #6c7086; }
     .ds-cache-track { background: rgba(255,255,255,0.06); }
-    .ds-cache-fill { background: linear-gradient(90deg, #89b4fa, #a6e3a1); }
-    .ds-cache-pct { color: #a6e3a1; }
-    .ds-summary-bar { background: rgba(0,0,0,0.2); border-top: 1px solid rgba(255,255,255,0.06); color: #6c7086; }
-    .ds-sum-val { color: #a6adc8; }
+    .ds-cache-fill { background: linear-gradient(90deg, #60a5fa, #34d399); box-shadow: 0 0 6px rgba(96,165,250,0.2); }
+    .ds-cache-pct { color: #34d399; }
+    .ds-summary-bar { background: rgba(15,15,30,0.5); border-top: 1px solid rgba(96,165,250,0.08); color: #94a3b8; }
+    .ds-sum-val { color: #e2e8f0; }
     .ds-summary-dot { background: #45475a; }
     .ds-no-data { color: #585b70; }
     #ds-monitor-panel.ds-collapsed .ds-body,
@@ -548,38 +757,54 @@
     .ds-calendar th { color: #6c7086; }
     .ds-calendar-day { color: #cdd6f4; }
     .ds-calendar-day.other-month { color: #585b70; }
-    .ds-calendar-day.has-data { background: rgba(137, 180, 250, 0.2); border-radius: 4px; font-weight: 600; }
-    .ds-calendar-day.selected { background: #89b4fa; color: #1e1e2e; border-radius: 4px; }
-    .ds-calendar-day:hover { background: rgba(137, 180, 250, 0.4); border-radius: 4px; }
-    .ds-calendar-day.today { box-shadow: inset 0 0 0 1.5px #89b4fa; }
+    .ds-calendar-day.has-data { background: rgba(96, 165, 250, 0.18); border-radius: 6px; font-weight: 600; }
+    .ds-calendar-day.selected { background: #60a5fa; color: #0f0f1a; border-radius: 6px; box-shadow: 0 2px 8px rgba(96,165,250,0.3); }
+    .ds-calendar-day:hover { background: rgba(96, 165, 250, 0.4); border-radius: 6px; transform: scale(1.08); }
+    .ds-calendar-day.today { box-shadow: inset 0 0 0 1.5px #60a5fa, 0 0 10px rgba(96,165,250,0.25); }
     .ds-calendar-cost { display: block; font-size: 8px; line-height: 1.1; opacity: 0.65; margin-top: 0px; }
-    .ds-calendar-today-btn { font-size: 11px; color: #89b4fa; cursor: pointer; background: none; border: none; padding: 2px 6px; border-radius: 3px; }
-    .ds-calendar-today-btn:hover { background: rgba(137, 180, 250, 0.2); }
+    .ds-calendar-today-btn { font-size: 11px; color: #60a5fa; cursor: pointer; background: none; border: none; padding: 2px 6px; border-radius: 3px; }
+    .ds-calendar-today-btn:hover { background: rgba(96, 165, 250, 0.2); }
     .ds-calendar-tooltip { position: absolute; display: none; background: rgba(30,30,46,0.96); border: 1px solid rgba(255,255,255,0.15); border-radius: 8px; padding: 6px 10px; font-size: 11px; line-height: 1.5; z-index: 100001; pointer-events: none; box-shadow: 0 4px 14px rgba(0,0,0,0.4); white-space: nowrap; }
     .ds-calendar-tooltip .ds-tt-row { display: flex; justify-content: space-between; gap: 12px; }
     .ds-calendar-tooltip .ds-tt-label { opacity: 0.6; }
     .ds-calendar-tooltip .ds-tt-val { font-weight: 600; }
+    .ds-calendar-tooltip .ds-tt-title { font-weight: 700; margin-bottom: 4px; }
+    .ds-calendar-tooltip .ds-tt-divider { height: 1px; background: rgba(255,255,255,0.08); margin: 5px 0; }
     .ds-calendar-summary { margin-top: 6px; padding: 5px 4px 2px; border-top: 1px solid rgba(255,255,255,0.08); font-size: 10px; display: flex; flex-wrap: wrap; gap: 8px; opacity: 0.7; }
-    .ds-calendar-summary b { opacity: 0.9; }
+    .ds-calendar-summary b { opacity: 0.95; color: #e2e8f0; }
     @keyframes ds-calendar-in { from { opacity: 0; transform: scale(0.96) translateY(-4px); } to { opacity: 1; transform: scale(1) translateY(0); } }
     .ds-calendar { animation: ds-calendar-in 0.15s ease-out; }
-    .ds-calendar-day { transition: background 0.12s, color 0.12s, transform 0.12s; }
-    .ds-view-tabs { display: flex; gap: 2px; margin-bottom: 10px; }
+    .ds-calendar-day { transition: background 0.15s, color 0.15s, transform 0.15s, box-shadow 0.15s; }
+    .ds-view-tabs { display: flex; gap: 2px; margin-bottom: 10px; position: sticky; top: -8px; z-index: 4; padding: 8px 0 6px; background: rgba(30, 30, 46, 0.98); backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px); }
     .ds-view-tab { flex: 1; padding: 4px 0; border: none; background: none; cursor: pointer; font-size: 11px; border-radius: 4px; color: #6c7086; transition: background 0.12s, color 0.12s; }
-    .ds-view-tab.active { background: rgba(137,180,250,0.2); color: #89b4fa; font-weight: 600; }
+    .ds-view-tab.active { background: rgba(96,165,250,0.15); color: #60a5fa; font-weight: 600; }
     .ds-view-tab:hover:not(.active) { background: rgba(255,255,255,0.05); }
-    .ds-week-grid { display: flex; flex-direction: column; gap: 0; }
-    .ds-week-row { display: grid; grid-template-columns: repeat(7, 1fr); gap: 1px; }
-    .ds-week-cell { text-align: center; padding: 3px 2px; border-radius: 4px; font-size: 11px; cursor: pointer; color: #cdd6f4; transition: background 0.12s; }
+    .ds-week-grid { display: flex; flex-direction: column; gap: 6px; }
+    .ds-week-row { display: grid; grid-template-columns: repeat(7, 1fr); gap: 0; }
+    .ds-week-cell { text-align: center; padding: 2px 0; border-radius: 4px; font-size: 11px; cursor: pointer; color: #cdd6f4; transition: background 0.12s; }
     .ds-week-cell.other-week { opacity: 0.3; }
     .ds-week-cell.has-data { background: rgba(137,180,250,0.2); font-weight: 600; }
     .ds-week-cell:hover { background: rgba(137,180,250,0.35); }
     .ds-week-cell.today { box-shadow: inset 0 0 0 1.5px #89b4fa; }
     .ds-week-label { font-size: 9px; opacity: 0.5; margin: 6px 0 1px; }
-    .ds-week-summary { font-size: 9px; opacity: 0.5; text-align: right; margin-bottom: 4px; padding-top: 2px; border-top: 1px solid rgba(255,255,255,0.06); }
+    .ds-week-header,
+    .ds-week-summary { display: grid; grid-template-columns: 52px 56px minmax(54px, 1fr) 40px 38px; align-items: center; column-gap: 4px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .ds-week-header { font-size: 9px; opacity: 0.46; padding: 0 4px 2px; }
+    .ds-week-summary { font-size: 10px; opacity: 0.72; margin: 0; padding: 6px 4px; border-top: 1px solid rgba(255,255,255,0.06); cursor: default; }
+    .ds-week-summary:hover { background: rgba(96,165,250,0.1); }
+    .ds-week-month-header { font-size: 10px; font-weight: 700; color: #60a5fa; padding: 8px 4px 2px; border-top: 1px solid rgba(255,255,255,0.08); }
+    .ds-week-month-header:first-child { border-top: none; padding-top: 0; }
+    .ds-week-loading { font-size: 9px; opacity: 0.52; padding: 0 4px 2px; }
+    .ds-week-header span,
+    .ds-week-summary span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+    .ds-week-cost,
+    .ds-week-token,
+    .ds-week-requests,
+    .ds-week-hitrate { text-align: right; }
     .ds-range-indicator { font-size: 10px; text-align: center; opacity: 0.7; margin-bottom: 6px; min-height: 16px; }
     .ds-range-clear { font-size: 10px; cursor: pointer; text-align: center; opacity: 0.6; margin-top: 2px; }
-    .ds-range-clear:hover { opacity: 1; color: #89b4fa; }
+    .ds-sum-break { width: 100%; height: 0; overflow: hidden; }
+    .ds-range-clear:hover { opacity: 1; color: #60a5fa; }
     .ds-calendar-day.range-start { background: #89b4fa !important; color: #1e1e2e !important; border-radius: 4px 0 0 4px !important; }
     .ds-calendar-day.range-end { background: #89b4fa !important; color: #1e1e2e !important; border-radius: 0 4px 4px 0 !important; }
     .ds-calendar-day.range-mid { background: rgba(137, 180, 250, 0.50) !important; color: #1e1e2e !important; border-radius: 0 !important; }
@@ -591,11 +816,11 @@
   const lightThemeStyle = `
     #ds-monitor-panel {
       background: rgba(245, 245, 250, 0.96);
-      backdrop-filter: blur(24px);
-      -webkit-backdrop-filter: blur(24px);
-      border: 1px solid rgba(0,0,0,0.1);
+      backdrop-filter: blur(28px);
+      -webkit-backdrop-filter: blur(28px);
+      border: 1px solid rgba(0,0,0,0.08);
       color: #1e1e2e;
-      box-shadow: 0 12px 40px rgba(0,0,0,0.15), 0 0 0 0.5px rgba(0,0,0,0.05);
+      box-shadow: 0 12px 40px rgba(0,0,0,0.1), 0 0 0 0.5px rgba(0,0,0,0.04);
     }
     .ds-titlebar { border-bottom: 1px solid rgba(0,0,0,0.08); }
     .ds-title { color: #1e1e2e; }
@@ -604,21 +829,21 @@
     .ds-btn:hover { background: rgba(0,0,0,0.05); color: #1e1e2e; }
     .ds-acct-label { color: #7c7f8a; }
     .ds-acct-value { color: #1e1e2e; }
-    .ds-acct-value.accent { background: linear-gradient(135deg, #1e66f5, #40a02b); -webkit-background-clip: text; background-clip: text; }
+    .ds-acct-value.accent { background: linear-gradient(135deg, #2563eb, #059669); -webkit-background-clip: text; background-clip: text; }
     .ds-acct-unit { color: #9ca0b0; }
     .ds-section-gap { background: rgba(0,0,0,0.08); }
-    .ds-model-block { background: rgba(0,0,0,0.03); border: 1px solid rgba(0,0,0,0.06); }
+    .ds-model-block { background: rgba(255,255,255,0.6); border: 1px solid rgba(0,0,0,0.06); box-shadow: 0 1px 4px rgba(0,0,0,0.04); }
     .ds-model-id { color: #d4611a; }
     .ds-model-sep { background: rgba(0,0,0,0.06); }
     .ds-metric-val { color: #1e1e2e; }
-    .ds-metric-val.green { color: #2e7d32; }
+    .ds-metric-val.green { color: #059669; }
     .ds-metric-val.yellow { color: #b95b0a; }
     .ds-metric-lbl { color: #7c7f8a; }
     .ds-cache-row { border-top: 1px solid rgba(0,0,0,0.08); }
     .ds-cache-label { color: #7c7f8a; }
     .ds-cache-track { background: rgba(0,0,0,0.08); }
-    .ds-cache-fill { background: linear-gradient(90deg, #1e66f5, #40a02b); }
-    .ds-cache-pct { color: #40a02b; }
+    .ds-cache-fill { background: linear-gradient(90deg, #2563eb, #059669); box-shadow: 0 0 6px rgba(37,99,235,0.15); }
+    .ds-cache-pct { color: #059669; }
     .ds-summary-bar { background: rgba(0,0,0,0.03); border-top: 1px solid rgba(0,0,0,0.08); color: #7c7f8a; }
     .ds-sum-val { color: #1e1e2e; }
     .ds-summary-dot { background: #c0c2ce; }
@@ -629,45 +854,60 @@
     .ds-calendar th { color: #7c7f8a; }
     .ds-calendar-day { color: #1e1e2e; }
     .ds-calendar-day.other-month { color: #9ca0b0; }
-    .ds-calendar-day.has-data { background: rgba(30, 102, 245, 0.15); border-radius: 4px; font-weight: 600; }
-    .ds-calendar-day.selected { background: #1e66f5; color: #ffffff; border-radius: 4px; }
-    .ds-calendar-day:hover { background: rgba(30, 102, 245, 0.3); border-radius: 4px; }
-    .ds-calendar-day.today { box-shadow: inset 0 0 0 1.5px #1e66f5; }
+    .ds-calendar-day.has-data { background: rgba(37, 99, 235, 0.12); border-radius: 6px; font-weight: 600; }
+    .ds-calendar-day.selected { background: #2563eb; color: #ffffff; border-radius: 6px; box-shadow: 0 2px 8px rgba(37,99,235,0.25); }
+    .ds-calendar-day:hover { background: rgba(37, 99, 235, 0.25); border-radius: 6px; transform: scale(1.08); }
+    .ds-calendar-day.today { box-shadow: inset 0 0 0 1.5px #2563eb, 0 0 10px rgba(37,99,235,0.15); }
     .ds-calendar-cost { display: block; font-size: 8px; line-height: 1.1; opacity: 0.6; margin-top: 0px; }
-    .ds-calendar-today-btn { font-size: 11px; color: #1e66f5; cursor: pointer; background: none; border: none; padding: 2px 6px; border-radius: 3px; }
-    .ds-calendar-today-btn:hover { background: rgba(30, 102, 245, 0.12); }
+    .ds-calendar-today-btn { font-size: 11px; color: #2563eb; cursor: pointer; background: none; border: none; padding: 2px 6px; border-radius: 3px; }
+    .ds-calendar-today-btn:hover { background: rgba(37, 99, 235, 0.12); }
     .ds-calendar-tooltip { position: absolute; display: none; background: rgba(245,245,250,0.97); border: 1px solid rgba(0,0,0,0.12); border-radius: 8px; padding: 6px 10px; font-size: 11px; line-height: 1.5; z-index: 100001; pointer-events: none; box-shadow: 0 4px 14px rgba(0,0,0,0.12); white-space: nowrap; }
     .ds-calendar-tooltip .ds-tt-row { display: flex; justify-content: space-between; gap: 12px; }
     .ds-calendar-tooltip .ds-tt-label { opacity: 0.55; }
     .ds-calendar-tooltip .ds-tt-val { font-weight: 600; }
+    .ds-calendar-tooltip .ds-tt-title { font-weight: 700; margin-bottom: 4px; }
+    .ds-calendar-tooltip .ds-tt-divider { height: 1px; background: rgba(0,0,0,0.08); margin: 5px 0; }
     .ds-calendar-summary { margin-top: 6px; padding: 5px 4px 2px; border-top: 1px solid rgba(0,0,0,0.08); font-size: 10px; display: flex; flex-wrap: wrap; gap: 8px; opacity: 0.65; }
     .ds-calendar-summary b { opacity: 0.85; }
     @keyframes ds-calendar-in { from { opacity: 0; transform: scale(0.96) translateY(-4px); } to { opacity: 1; transform: scale(1) translateY(0); } }
     .ds-calendar { animation: ds-calendar-in 0.15s ease-out; }
-    .ds-calendar-day { transition: background 0.12s, color 0.12s, transform 0.12s; }
-    .ds-view-tabs { display: flex; gap: 2px; margin-bottom: 10px; }
+    .ds-calendar-day { transition: background 0.15s, color 0.15s, transform 0.15s, box-shadow 0.15s; }
+    .ds-view-tabs { display: flex; gap: 2px; margin-bottom: 10px; position: sticky; top: -8px; z-index: 4; padding: 8px 0 6px; background: rgba(245, 245, 250, 0.98); backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px); }
     .ds-view-tab { flex: 1; padding: 4px 0; border: none; background: none; cursor: pointer; font-size: 11px; border-radius: 4px; color: #7c7f8a; transition: background 0.12s, color 0.12s; }
-    .ds-view-tab.active { background: rgba(30,102,245,0.12); color: #1e66f5; font-weight: 600; }
+    .ds-view-tab.active { background: rgba(37,99,235,0.10); color: #2563eb; font-weight: 600; }
     .ds-view-tab:hover:not(.active) { background: rgba(0,0,0,0.04); }
-    .ds-week-grid { display: flex; flex-direction: column; gap: 0; }
-    .ds-week-row { display: grid; grid-template-columns: repeat(7, 1fr); gap: 1px; }
-    .ds-week-cell { text-align: center; padding: 3px 2px; border-radius: 4px; font-size: 11px; cursor: pointer; color: #1e1e2e; transition: background 0.12s; }
+    .ds-week-grid { display: flex; flex-direction: column; gap: 6px; }
+    .ds-week-row { display: grid; grid-template-columns: repeat(7, 1fr); gap: 0; }
+    .ds-week-cell { text-align: center; padding: 2px 0; border-radius: 4px; font-size: 11px; cursor: pointer; color: #1e1e2e; transition: background 0.12s; }
     .ds-week-cell.other-week { opacity: 0.3; }
     .ds-week-cell.has-data { background: rgba(30,102,245,0.15); font-weight: 600; }
     .ds-week-cell:hover { background: rgba(30,102,245,0.25); }
     .ds-week-cell.today { box-shadow: inset 0 0 0 1.5px #1e66f5; }
     .ds-week-label { font-size: 9px; opacity: 0.5; margin: 6px 0 1px; }
-    .ds-week-summary { font-size: 9px; opacity: 0.5; text-align: right; margin-bottom: 4px; padding-top: 2px; border-top: 1px solid rgba(0,0,0,0.08); }
+    .ds-week-header,
+    .ds-week-summary { display: grid; grid-template-columns: 52px 56px minmax(54px, 1fr) 40px 38px; align-items: center; column-gap: 4px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .ds-week-header { font-size: 9px; opacity: 0.46; padding: 0 4px 2px; }
+    .ds-week-summary { font-size: 10px; opacity: 0.72; margin: 0; padding: 6px 4px; border-top: 1px solid rgba(0,0,0,0.08); cursor: default; }
+    .ds-week-summary:hover { background: rgba(37,99,235,0.06); }
+    .ds-week-month-header { font-size: 10px; font-weight: 700; color: #2563eb; padding: 8px 4px 2px; border-top: 1px solid rgba(0,0,0,0.08); }
+    .ds-week-month-header:first-child { border-top: none; padding-top: 0; }
+    .ds-week-loading { font-size: 9px; opacity: 0.52; padding: 0 4px 2px; }
+    .ds-week-header span,
+    .ds-week-summary span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+    .ds-week-cost,
+    .ds-week-token,
+    .ds-week-requests,
+    .ds-week-hitrate { text-align: right; }
     .ds-range-indicator { font-size: 10px; text-align: center; opacity: 0.7; margin-bottom: 6px; min-height: 16px; }
     .ds-range-clear { font-size: 10px; cursor: pointer; text-align: center; opacity: 0.6; margin-top: 2px; }
-    .ds-range-clear:hover { opacity: 1; color: #1e66f5; }
-    .ds-calendar-day.range-start { background: #1e66f5 !important; color: #ffffff !important; border-radius: 4px 0 0 4px !important; }
-    .ds-calendar-day.range-end { background: #1e66f5 !important; color: #ffffff !important; border-radius: 0 4px 4px 0 !important; }
-    .ds-calendar-day.range-mid { background: rgba(30, 102, 245, 0.40) !important; color: #ffffff !important; border-radius: 0 !important; }
+    .ds-sum-break { width: 100%; height: 0; overflow: hidden; }
+    .ds-range-clear:hover { opacity: 1; color: #2563eb; }
+    .ds-calendar-day.range-start { background: #2563eb !important; color: #ffffff !important; border-radius: 6px 0 0 6px !important; }
+    .ds-calendar-day.range-end { background: #2563eb !important; color: #ffffff !important; border-radius: 0 6px 6px 0 !important; }
+    .ds-calendar-day.range-mid { background: rgba(37, 99, 235, 0.35) !important; color: #1c1917 !important; border-radius: 0 !important; }
     .ds-calendar-day.range-start:hover,
-    .ds-calendar-day.range-end:hover { background: #1e66f5 !important; }
-    .ds-calendar-day.range-mid:hover { background: rgba(30, 102, 245, 0.55) !important; }
-    .ds-calendar-day.range-mid:hover { background: rgba(30, 102, 245, 0.40) !important; }
+    .ds-calendar-day.range-end:hover { background: #2563eb !important; }
+    .ds-calendar-day.range-mid:hover { background: rgba(37, 99, 235, 0.50) !important; }
   `;
 
   let currentTheme = 'dark';
@@ -736,19 +976,191 @@
 
   // 日历键盘光标
   let calendarCursorDate = null;
+  let weekAutoScrollMonthKey = null;
+
+  function getUsageMonthSelect() {
+    const selects = document.querySelectorAll('select');
+    for (const select of selects) {
+      const options = Array.from(select.options || []);
+      if (options.some(option => parseMonthKey(option.value))) {
+        return select;
+      }
+    }
+    return null;
+  }
+
+  function getSelectedPageMonth() {
+    const select = getUsageMonthSelect();
+    if (select) {
+      const selected = parseMonthKey(select.value);
+      if (selected) return selected;
+    }
+    return null;
+  }
+
+  function getSelectableUsageMonths() {
+    const select = getUsageMonthSelect();
+    if (!select) return [];
+    const months = [];
+    const seen = new Set();
+    for (const option of Array.from(select.options || [])) {
+      const parsed = parseMonthKey(option.value);
+      if (parsed && !seen.has(parsed.key)) {
+        months.push(parsed);
+        seen.add(parsed.key);
+      }
+    }
+    return months.sort(compareMonthInfo);
+  }
+
+  function canSelectUsageMonth(year, month) {
+    return getUsageMonthOptionValue(year, month) !== null;
+  }
+
+  function getUsageMonthOptionValue(year, month) {
+    const select = getUsageMonthSelect();
+    if (!select) return null;
+    const key = monthKey(year, month);
+    for (const option of Array.from(select.options || [])) {
+      const parsed = parseMonthKey(option.value);
+      if (parsed && parsed.key === key) return option.value;
+    }
+    return null;
+  }
+
+  function setNativeSelectValue(select, value) {
+    const descriptor = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value');
+    if (descriptor && descriptor.set) descriptor.set.call(select, value);
+    else select.value = value;
+    select.dispatchEvent(new Event('input', { bubbles: true }));
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function selectUsageMonth(year, month) {
+    const select = getUsageMonthSelect();
+    if (!select) return false;
+    const key = monthKey(year, month);
+    const optionValue = getUsageMonthOptionValue(year, month);
+    if (!optionValue) return false;
+
+    currentCalendarYear = year;
+    currentCalendarMonth = month;
+    calendarCursorDate = null;
+    hideCalendarTooltip();
+
+    if (currentViewMode === 'range') {
+      rangePhase = 'select-start';
+      rangeStartDate = null;
+      rangeEndDate = null;
+    }
+    if (selectedDate) {
+      const selectedParts = selectedDate.split('-');
+      const selectedYear = parseInt(selectedParts[0], 10);
+      const selectedMonth = parseInt(selectedParts[1], 10) - 1;
+      if (selectedYear !== year || selectedMonth !== month) {
+        currentView = 'today';
+        selectedDate = null;
+      }
+    }
+
+    if (parseMonthKey(select.value)?.key !== key) {
+      pendingCalendarMonthKey = key;
+      dailyDataMap.clear();
+      setNativeSelectValue(select, optionValue);
+    }
+    return true;
+  }
+
+  function calendarMonthDataReady() {
+    const key = monthKey(currentCalendarYear, currentCalendarMonth);
+    return usageAmountByMonth.has(key) && usageCostByMonth.has(key);
+  }
+
+  function isCalendarMonthLoading() {
+    const selected = getSelectedPageMonth();
+    const key = monthKey(currentCalendarYear, currentCalendarMonth);
+    return selected && selected.key === key && !calendarMonthDataReady();
+  }
+
+  // 获取页面所选月份（优先使用页面原生月份下拉框）
+  function getPageMonth() {
+    const selected = getSelectedPageMonth();
+    if (selected) return { year: selected.year, month: selected.month };
+    if (rawUsageAmountMonthKey) {
+      const parsed = parseMonthKey(rawUsageAmountMonthKey);
+      if (parsed) return { year: parsed.year, month: parsed.month };
+    }
+    var n = new Date();
+    return { year: n.getFullYear(), month: n.getMonth() };
+  }
 
   // 从页面数据中获取当前显示的月份
   function updateCalendarMonthFromData() {
-    if (rawUsageAmount && rawUsageAmount.days && rawUsageAmount.days.length > 0) {
-      var firstDate = rawUsageAmount.days[0].date;
-      var parts = firstDate.split('-');
-      currentCalendarYear = parseInt(parts[0]);
-      currentCalendarMonth = parseInt(parts[1]) - 1;
-    } else {
-      var now = new Date();
-      currentCalendarYear = now.getFullYear();
-      currentCalendarMonth = now.getMonth();
+    var pageMonth = getPageMonth();
+    currentCalendarYear = pageMonth.year;
+    currentCalendarMonth = pageMonth.month;
+  }
+
+  function storeBackgroundUsageData(endpoint, bizData, key) {
+    const resolvedKey = getBizDataMonthKey(bizData) || key;
+    if (!resolvedKey) return;
+    if (endpoint === 'usage_amount') usageAmountByMonth.set(resolvedKey, bizData);
+    else if (endpoint === 'usage_cost') usageCostByMonth.set(resolvedKey, bizData);
+  }
+
+  function fetchUsageMonthEndpoint(endpoint, monthInfo) {
+    const url = buildUsageMonthUrl(usageRequestUrls[endpoint], monthInfo.year, monthInfo.month);
+    if (!url) return;
+    const inFlightKey = endpoint + ':' + monthInfo.key;
+    if (usageBackgroundInFlight.has(inFlightKey)) return;
+    usageBackgroundInFlight.add(inFlightKey);
+
+    const headers = {};
+    if (bearerToken) headers.Authorization = 'Bearer ' + bearerToken;
+    origFetch.call(window, url, {
+      method: 'GET',
+      credentials: 'include',
+      headers,
+    }).then(function(response) {
+      if (!response.ok) return null;
+      return response.clone().json().catch(function() { return null; });
+    }).then(function(json) {
+      const bizData = extractBizData(json);
+      if (bizData) {
+        storeBackgroundUsageData(endpoint, bizData, monthInfo.key);
+        if (calendarOverlay && calendarOverlay.style.display === 'block' && currentViewMode === 'week' && calendarRefreshFn) {
+          calendarRefreshFn();
+        }
+      }
+    }).catch(function() {
+      // 后台补取失败不影响当前月份视图。
+    }).finally(function() {
+      usageBackgroundInFlight.delete(inFlightKey);
+    });
+  }
+
+  function ensureUsageMonthLoaded(monthInfo) {
+    if (!usageAmountByMonth.has(monthInfo.key)) fetchUsageMonthEndpoint('usage_amount', monthInfo);
+    if (!usageCostByMonth.has(monthInfo.key)) fetchUsageMonthEndpoint('usage_cost', monthInfo);
+  }
+
+  function isUsageMonthLoading(monthKeyValue) {
+    return usageBackgroundInFlight.has('usage_amount:' + monthKeyValue) ||
+      usageBackgroundInFlight.has('usage_cost:' + monthKeyValue);
+  }
+
+  function isUsageMonthComplete(monthKeyValue) {
+    return usageAmountByMonth.has(monthKeyValue) && usageCostByMonth.has(monthKeyValue);
+  }
+
+  function getWeekTimelineMonths(year, month) {
+    const selectable = getSelectableUsageMonths();
+    if (selectable.length > 0) return selectable;
+    const months = [];
+    for (let offset = -2; offset <= 2; offset++) {
+      months.push(addMonths(year, month, offset));
     }
+    return months;
   }
 
   // 显示某个日期的详情
@@ -814,14 +1226,15 @@
 
     const table = document.createElement('table');
     table.style.width = '100%';
-    table.style.borderCollapse = 'collapse';
-    table.style.fontSize = '12px';
+    table.style.borderCollapse = 'separate';
+	    table.style.borderSpacing = '0';
+    table.style.fontSize = '11px';
     const thead = document.createElement('thead');
     const tr = document.createElement('tr');
     ['日', '一', '二', '三', '四', '五', '六'].forEach(day => {
       const th = document.createElement('th');
       th.textContent = day;
-      th.style.padding = '6px 0';
+      th.style.padding = '4px 0';
       th.style.fontWeight = '500';
       tr.appendChild(th);
     });
@@ -835,7 +1248,7 @@
         const td = document.createElement('td');
         td.setAttribute('data-date', localDateStr(cell.date));
         td.style.textAlign = 'center';
-        td.style.padding = '2px 0';
+        td.style.padding = '1px 0';
         const daySpan = document.createElement('span');
         daySpan.textContent = cell.date.getDate();
         daySpan.className = 'ds-calendar-day';
@@ -855,8 +1268,8 @@
         }
         daySpan.style.cursor = 'pointer';
         daySpan.style.display = 'inline-block';
-        daySpan.style.padding = '4px 6px';
-        daySpan.style.width = '28px';
+        daySpan.style.padding = '2px 0';
+        daySpan.style.width = '24px';
         daySpan.style.textAlign = 'center';
         daySpan.addEventListener('click', (e) => {
           e.stopPropagation();
@@ -916,7 +1329,51 @@
       top = cellRect.bottom - overlayRect.top + 4;
     }
     let left = cellRect.left - overlayRect.left + cellRect.width / 2;
-    left = Math.max(4, Math.min(left, overlayRect.width - ttWidth - 4));
+    left = Math.max(ttWidth / 2 + 4, Math.min(left, overlayRect.width - ttWidth / 2 - 4));
+
+    calendarTooltip.style.top = top + 'px';
+    calendarTooltip.style.left = left + 'px';
+    calendarTooltip.style.transform = 'translateX(-50%)';
+  }
+
+  function showWeekTooltip(event, weekLabel, summary) {
+    const overlay = calendarOverlay;
+    if (!overlay) return;
+    if (!calendarTooltip) {
+      calendarTooltip = document.createElement('div');
+      calendarTooltip.id = 'ds-calendar-tooltip';
+      calendarTooltip.className = 'ds-calendar-tooltip';
+      overlay.appendChild(calendarTooltip);
+    }
+    const hitRate = summary.overallHitRate;
+    calendarTooltip.innerHTML =
+      '<div class="ds-tt-title">' + escapeHTML(weekLabel) + '详情</div>' +
+      '<div class="ds-tt-row"><span class="ds-tt-label">费用</span><span class="ds-tt-val">' + fmtMoney(summary.totalCost || 0) + '</span></div>' +
+      '<div class="ds-tt-row"><span class="ds-tt-label">Token</span><span class="ds-tt-val">' + fmtNumShort(summary.totalTokens || 0) + '</span></div>' +
+      '<div class="ds-tt-row"><span class="ds-tt-label">请求</span><span class="ds-tt-val">' + (summary.totalRequests || 0).toLocaleString() + '</span></div>' +
+      '<div class="ds-tt-row"><span class="ds-tt-label">缓存命中</span><span class="ds-tt-val">' + (hitRate !== null ? hitRate.toFixed(1) + '%' : '—') + '</span></div>' +
+      '<div class="ds-tt-row"><span class="ds-tt-label">有数据天数</span><span class="ds-tt-val">' + (summary.dayCount || 0) + '</span></div>' +
+      '<div class="ds-tt-divider"></div>' +
+      '<div class="ds-tt-row"><span class="ds-tt-label">Pro 费用</span><span class="ds-tt-val">' + fmtMoney(summary.proCost || 0) + '</span></div>' +
+      '<div class="ds-tt-row"><span class="ds-tt-label">Flash 费用</span><span class="ds-tt-val">' + fmtMoney(summary.flashCost || 0) + '</span></div>' +
+      '<div class="ds-tt-row"><span class="ds-tt-label">Pro Token</span><span class="ds-tt-val">' + fmtNumShort(summary.proTokens || 0) + '</span></div>' +
+      '<div class="ds-tt-row"><span class="ds-tt-label">Flash Token</span><span class="ds-tt-val">' + fmtNumShort(summary.flashTokens || 0) + '</span></div>' +
+      '<div class="ds-tt-row"><span class="ds-tt-label">Pro 请求</span><span class="ds-tt-val">' + (summary.proRequests || 0).toLocaleString() + '</span></div>' +
+      '<div class="ds-tt-row"><span class="ds-tt-label">Flash 请求</span><span class="ds-tt-val">' + (summary.flashRequests || 0).toLocaleString() + '</span></div>';
+    calendarTooltip.style.display = 'block';
+
+    const cell = event.currentTarget || event.target;
+    const cellRect = cell.getBoundingClientRect();
+    const overlayRect = overlay.getBoundingClientRect();
+    const ttHeight = calendarTooltip.offsetHeight || 120;
+    const ttWidth = calendarTooltip.offsetWidth || 170;
+
+    let top = cellRect.top - overlayRect.top - ttHeight - 4;
+    if (top < 4) {
+      top = cellRect.bottom - overlayRect.top + 4;
+    }
+    let left = cellRect.left - overlayRect.left + cellRect.width / 2;
+    left = Math.max(ttWidth / 2 + 4, Math.min(left, overlayRect.width - ttWidth / 2 - 4));
 
     calendarTooltip.style.top = top + 'px';
     calendarTooltip.style.left = left + 'px';
@@ -930,6 +1387,7 @@
   function buildMonthlySummary(year, month) {
     let totalCost = 0, totalTokens = 0, totalRequests = 0, dayCount = 0;
     let proTokens = 0, flashTokens = 0;
+    let totalCached = 0, totalInput = 0;
     for (const [dateStr, dayData] of dailyDataMap.entries()) {
       const parts = dateStr.split('-');
       if (parseInt(parts[0]) === year && parseInt(parts[1]) - 1 === month) {
@@ -941,6 +1399,10 @@
           for (const modelName of Object.keys(dayData.models)) {
             const m = dayData.models[modelName];
             const tokens = m.tokens ? (m.tokens.total || 0) : 0;
+            const cached = m.tokens ? (m.tokens.cached_input || 0) : 0;
+            const uncached = m.tokens ? (m.tokens.uncached_input || 0) : 0;
+            totalCached += cached;
+            totalInput += cached + uncached;
             const lower = modelName.toLowerCase();
             if (lower.includes('pro')) proTokens += tokens;
             else if (lower.includes('flash')) flashTokens += tokens;
@@ -948,15 +1410,19 @@
         }
       }
     }
+    const overallHitRate = totalInput > 0 ? (totalCached / totalInput) * 100 : null;
     const div = document.createElement('div');
     div.className = 'ds-calendar-summary';
     div.innerHTML =
-      '<span>(' + (month + 1) + '月) 合计</span>' +
+      '<span style="width:100%">(' + (month + 1) + '月) 合计</span>' +
       '<span>费用 <b>￥' + totalCost.toFixed(2) + '</b></span>' +
       '<span>Token <b>' + fmtNumShort(totalTokens) + '</b></span>' +
       '<span>请求 <b>' + totalRequests.toLocaleString() + '</b></span>' +
-      '<span>Pro ' + fmtNumShort(proTokens) + ' | Flash ' + fmtNumShort(flashTokens) + '</span>' +
-      '<span>天数 ' + dayCount + '</span>';
+      '<span class="ds-sum-break"></span>' +
+      '<span>Pro ' + fmtNumShort(proTokens) + '</span>' +
+      '<span>Flash ' + fmtNumShort(flashTokens) + '</span>' +
+      '<span>天数 ' + dayCount + '</span>' +
+      '<span>命中率 <b>' + (overallHitRate !== null ? overallHitRate.toFixed(1) + '%' : '—') + '</b></span>';
     return div;
   }
 
@@ -988,38 +1454,109 @@
     return weeks;
   }
 
+  function getContinuousWeeksForMonths(months) {
+    if (!months || months.length === 0) return [];
+    const sorted = months.slice().sort(compareMonthInfo);
+    const first = sorted[0];
+    const last = sorted[sorted.length - 1];
+    const firstDay = new Date(Date.UTC(first.year, first.month, 1));
+    const lastDay = new Date(Date.UTC(last.year, last.month + 1, 0));
+    const current = new Date(getWeekMonday(firstDay.toISOString().slice(0, 10)) + 'T00:00:00Z');
+    const weeks = [];
+    while (current <= lastDay || weeks.length === 0) {
+      weeks.push(current.toISOString().slice(0, 10));
+      current.setUTCDate(current.getUTCDate() + 7);
+    }
+    return weeks;
+  }
+
+  function getWeekMonthKeys(weekMonday) {
+    const start = new Date(weekMonday + 'T00:00:00Z');
+    const keys = [];
+    const seen = new Set();
+    for (let i = 0; i < 7; i++) {
+      const d = new Date(start);
+      d.setUTCDate(d.getUTCDate() + i);
+      const key = monthKey(d.getUTCFullYear(), d.getUTCMonth());
+      if (!seen.has(key)) {
+        seen.add(key);
+        keys.push(key);
+      }
+    }
+    return keys;
+  }
+
+  function getWeekDisplayMonth(weekMonday) {
+    const start = new Date(weekMonday + 'T00:00:00Z');
+    const counts = {};
+    const order = [];
+    for (let i = 0; i < 7; i++) {
+      const d = new Date(start);
+      d.setUTCDate(d.getUTCDate() + i);
+      const key = monthKey(d.getUTCFullYear(), d.getUTCMonth());
+      if (counts[key] === undefined) {
+        counts[key] = { count: 0, year: d.getUTCFullYear(), month: d.getUTCMonth(), key };
+        order.push(key);
+      }
+      counts[key].count++;
+    }
+    let best = counts[order[0]];
+    for (const key of order) {
+      const item = counts[key];
+      if (item.count >= best.count) best = item;
+    }
+    return { year: best.year, month: best.month, key: best.key };
+  }
+
+  function getWeekNumberWithinMonth(weekMonday, year, month) {
+    const weeks = getWeeksForMonth(year, month);
+    const idx = weeks.indexOf(weekMonday);
+    return idx >= 0 ? idx + 1 : 1;
+  }
+
   // 聚合指定周的数据
-  function buildWeeklySummary(weekMonday) {
+  function buildWeeklySummary(weekMonday, sourceMap) {
+    const dataMap = sourceMap || dailyDataMap;
     const start = new Date(weekMonday + 'T00:00:00Z');
     const end = new Date(start);
     end.setUTCDate(end.getUTCDate() + 7);
     let totalCost = 0, totalTokens = 0, totalRequests = 0, dayCount = 0;
-    for (const [dateStr, dayData] of dailyDataMap.entries()) {
+    let totalCached = 0, totalInput = 0;
+    let proTokens = 0, flashTokens = 0, proRequests = 0, flashRequests = 0;
+    let proCost = 0, flashCost = 0;
+    for (const [dateStr, dayData] of dataMap.entries()) {
       const d = new Date(dateStr + 'T00:00:00Z');
       if (d >= start && d < end) {
         totalCost += dayData.totalCost || 0;
         totalTokens += dayData.totalTokens || 0;
         totalRequests += dayData.totalRequests || 0;
         dayCount++;
-      }
-    }
-    // 聚合缓存命中率（加权平均）
-    let overallHitRate = null;
-    let totalHits = 0, totalMisses = 0;
-    for (const [dateStr, dayData] of dailyDataMap.entries()) {
-      const d = new Date(dateStr + 'T00:00:00Z');
-      if (d >= start && d < end && dayData.models) {
-        for (const modelName of Object.keys(dayData.models)) {
+        for (const modelName of Object.keys(dayData.models || {})) {
           const m = dayData.models[modelName];
-          if (m.cache_hit_tokens !== undefined) totalHits += m.cache_hit_tokens;
-          if (m.cache_miss_tokens !== undefined) totalMisses += m.cache_miss_tokens;
+          const tokens = m.tokens || {};
+          const modelTokens = tokens.total || 0;
+          const modelRequests = m.requests || 0;
+          const modelCost = m.cost || 0;
+          const cached = tokens.cached_input || 0;
+          const uncached = tokens.uncached_input || 0;
+          const lower = modelName.toLowerCase();
+          totalCached += cached;
+          totalInput += cached + uncached;
+          if (lower.includes('pro')) {
+            proTokens += modelTokens;
+            proRequests += modelRequests;
+            proCost += modelCost;
+          } else if (lower.includes('flash')) {
+            flashTokens += modelTokens;
+            flashRequests += modelRequests;
+            flashCost += modelCost;
+          }
         }
       }
     }
-    const total = totalHits + totalMisses;
-    if (total > 0) overallHitRate = (totalHits / total) * 100;
+    const overallHitRate = totalInput > 0 ? (totalCached / totalInput) * 100 : null;
 
-    return { totalCost, totalTokens, totalRequests, dayCount, overallHitRate };
+    return { totalCost, totalTokens, totalRequests, dayCount, overallHitRate, proTokens, flashTokens, proRequests, flashRequests, proCost, flashCost };
   }
 
   // 聚合指定日期范围的数据
@@ -1028,7 +1565,7 @@
     const endDate = new Date(endDateStr + 'T00:00:00Z');
     endDate.setUTCDate(endDate.getUTCDate() + 1); // 包含结束日
     let totalCost = 0, totalTokens = 0, totalRequests = 0, dayCount = 0;
-    let totalHits = 0, totalMisses = 0;
+    let totalCached = 0, totalInput = 0;
     let proTokens = 0, flashTokens = 0;
     for (const [dateStr, dayData] of dailyDataMap.entries()) {
       const d = new Date(dateStr + 'T00:00:00Z');
@@ -1040,9 +1577,11 @@
         if (dayData.models) {
           for (const modelName of Object.keys(dayData.models)) {
             const m = dayData.models[modelName];
-            if (m.cache_hit_tokens !== undefined) totalHits += m.cache_hit_tokens;
-            if (m.cache_miss_tokens !== undefined) totalMisses += m.cache_miss_tokens;
             const tokens = m.tokens ? (m.tokens.total || 0) : 0;
+            const cached = m.tokens ? (m.tokens.cached_input || 0) : 0;
+            const uncached = m.tokens ? (m.tokens.uncached_input || 0) : 0;
+            totalCached += cached;
+            totalInput += cached + uncached;
             const lower = modelName.toLowerCase();
             if (lower.includes('pro')) proTokens += tokens;
             else if (lower.includes('flash')) flashTokens += tokens;
@@ -1051,74 +1590,82 @@
       }
     }
     let overallHitRate = null;
-    const totalCache = totalHits + totalMisses;
-    if (totalCache > 0) overallHitRate = (totalHits / totalCache) * 100;
+    if (totalInput > 0) overallHitRate = (totalCached / totalInput) * 100;
     return { totalCost, totalTokens, totalRequests, dayCount, overallHitRate, proTokens, flashTokens };
   }
 
   // 渲染周视图
   function renderWeekView(container, year, month) {
-    const weeks = getWeeksForMonth(year, month);
+    const months = getWeekTimelineMonths(year, month);
+    for (const item of months) ensureUsageMonthLoaded(item);
+    const monthKeys = months.map(function(item) { return item.key; });
+    const weekDataMap = buildDailyDataForMonthKeys(monthKeys);
+    const weeks = getContinuousWeeksForMonths(months);
     const grid = document.createElement('div');
     grid.className = 'ds-week-grid';
+    const unit = rawUserSummary ? (transformUserSummary(rawUserSummary).balance.currency === 'CNY' ? '￥' : '$') : '￥';
+    let currentMonthHeaderKey = null;
 
     for (let wi = 0; wi < weeks.length; wi++) {
-      const weekStart = new Date(weeks[wi] + 'T00:00:00Z');
-      const weekLabel = document.createElement('div');
-      weekLabel.className = 'ds-week-label';
-      const startM = weekStart.getUTCMonth() + 1;
-      const startD = weekStart.getUTCDate();
-      const weekEnd = new Date(weekStart);
-      weekEnd.setUTCDate(weekEnd.getUTCDate() + 6);
-      const endM = weekEnd.getUTCMonth() + 1;
-      const endD = weekEnd.getUTCDate();
-      weekLabel.textContent = startM + '/' + startD + ' — ' + endM + '/' + endD;
-      grid.appendChild(weekLabel);
+      const displayMonth = getWeekDisplayMonth(weeks[wi]);
+      if (displayMonth.key !== currentMonthHeaderKey) {
+        currentMonthHeaderKey = displayMonth.key;
+        const monthHeader = document.createElement('div');
+        monthHeader.className = 'ds-week-month-header';
+        monthHeader.setAttribute('data-week-month-key', displayMonth.key);
+        monthHeader.textContent = displayMonth.year + '年 ' + (displayMonth.month + 1) + '月';
+        grid.appendChild(monthHeader);
 
-      const row = document.createElement('div');
-      row.className = 'ds-week-row';
-      for (let di = 0; di < 7; di++) {
-        const d = new Date(weekStart);
-        d.setUTCDate(d.getUTCDate() + di);
-        const dateStr = d.toISOString().slice(0, 10);
-        const cell = document.createElement('span');
-        cell.className = 'ds-week-cell';
-        cell.textContent = d.getUTCDate();
-        if (d.getUTCMonth() !== month) cell.classList.add('other-week');
-        if (dailyDataMap.has(dateStr)) cell.classList.add('has-data');
-        if (dateStr === localToday()) cell.classList.add('today');
-        if (selectedDate === dateStr && d.getUTCMonth() === month) cell.classList.add('selected');
-        cell.title = dateStr;
-        cell.addEventListener('click', function(e) {
-          e.stopPropagation();
-          if (dailyDataMap.has(dateStr)) {
-            showDateDetail(dateStr);
-          }
-        });
-        cell.addEventListener('mouseenter', function(e) {
-          const dayData = dailyDataMap.get(dateStr);
-          if (dayData) showCalendarTooltip(e, dayData);
-        });
-        cell.addEventListener('mouseleave', function() { hideCalendarTooltip(); });
-        row.appendChild(cell);
-      }
-      grid.appendChild(row);
+        const header = document.createElement('div');
+        header.className = 'ds-week-header';
+        header.innerHTML =
+          '<span>周</span>' +
+          '<span class="ds-week-cost">费用</span>' +
+          '<span class="ds-week-token">Token</span>' +
+          '<span class="ds-week-requests">请求</span>' +
+          '<span class="ds-week-hitrate">命中</span>';
+        grid.appendChild(header);
 
-      // 周合计
-      const summary = buildWeeklySummary(weeks[wi]);
-      if (summary.dayCount > 0) {
-        const unit = rawUserSummary ? (transformUserSummary(rawUserSummary).balance.currency === 'CNY' ? '￥' : '$') : '￥';
-        const totalEl = document.createElement('div');
-        totalEl.className = 'ds-week-summary';
-        totalEl.textContent = '合计 ' + unit + summary.totalCost.toFixed(2) + ' | Token ' + fmtNumShort(summary.totalTokens) + ' | 请求 ' + summary.totalRequests.toLocaleString();
-        grid.appendChild(totalEl);
+        if (!isUsageMonthComplete(displayMonth.key)) {
+          const loading = document.createElement('div');
+          loading.className = 'ds-week-loading';
+          loading.textContent = isUsageMonthLoading(displayMonth.key) ? '正在加载该月份周数据…' : '该月份周数据尚未加载';
+          grid.appendChild(loading);
+        }
       }
+
+      const summary = buildWeeklySummary(weeks[wi], weekDataMap);
+      const weekNo = getWeekNumberWithinMonth(weeks[wi], displayMonth.year, displayMonth.month);
+      const weekLabel = (displayMonth.month + 1) + '月第' + weekNo + '周';
+      const missingWeekData = getWeekMonthKeys(weeks[wi]).some(function(key) {
+        return monthKeys.includes(key) && !isUsageMonthComplete(key);
+      });
+      const totalEl = document.createElement('div');
+      totalEl.className = 'ds-week-summary';
+      if (missingWeekData) totalEl.style.opacity = '0.46';
+      totalEl.innerHTML =
+        '<span>' + weekLabel + '</span>' +
+        '<span class="ds-week-cost">' + unit + summary.totalCost.toFixed(2) + '</span>' +
+        '<span class="ds-week-token">' + fmtNumShort(summary.totalTokens) + '</span>' +
+        '<span class="ds-week-requests">' + summary.totalRequests.toLocaleString() + '</span>' +
+        '<span class="ds-week-hitrate">' + (summary.overallHitRate !== null ? summary.overallHitRate.toFixed(1) + '%' : '—') + '</span>';
+      totalEl.addEventListener('mouseenter', function(e) {
+        showWeekTooltip(e, weekLabel, summary);
+      });
+      totalEl.addEventListener('mouseleave', function() { hideCalendarTooltip(); });
+      grid.appendChild(totalEl);
     }
 
-    // 整月合计
-    const monthSummary = buildMonthlySummary(year, month);
-    grid.appendChild(monthSummary);
     container.appendChild(grid);
+    if (weekAutoScrollMonthKey) {
+      const target = grid.querySelector('[data-week-month-key="' + weekAutoScrollMonthKey + '"]');
+      if (target) {
+        setTimeout(function() {
+          target.scrollIntoView({ block: 'start' });
+        }, 0);
+        weekAutoScrollMonthKey = null;
+      }
+    }
   }
 
   function createCalendarOverlay() {
@@ -1130,8 +1677,10 @@
       z-index: 100000;
       border-radius: 12px;
       box-shadow: 0 12px 32px rgba(0,0,0,0.35);
-      padding: 12px;
-      min-width: 296px;
+      padding: 8px;
+      width: 290px;
+      min-width: 290px;
+      max-width: 290px;
       font-family: inherit;
       max-height: 80vh;
       overflow-y: auto;
@@ -1154,6 +1703,9 @@
     calendarOverlay.style.display = 'block';
     // 从当前页面数据确定显示的月份
     updateCalendarMonthFromData();
+    if (currentViewMode === 'week') {
+      weekAutoScrollMonthKey = monthKey(currentCalendarYear, currentCalendarMonth);
+    }
     // 重新渲染内容
     calendarOverlay.innerHTML = '';
     const header = document.createElement('div');
@@ -1168,19 +1720,19 @@
     prevBtn.textContent = '◀';
     prevBtn.style.cssText = navBtnStyle;
     prevBtn.title = '上个月';
-    prevBtn.addEventListener('mouseenter', function() { prevBtn.style.cssText = navBtnStyle + ';' + navBtnHover; });
-    prevBtn.addEventListener('mouseleave', function() { prevBtn.style.cssText = navBtnStyle; });
+    prevBtn.addEventListener('mouseenter', function() { if (!prevBtn.disabled) prevBtn.style.cssText = navBtnStyle + ';' + navBtnHover; });
+    prevBtn.addEventListener('mouseleave', function() {
+      prevBtn.style.cssText = navBtnStyle + (prevBtn.disabled ? ';opacity:0.22;cursor:not-allowed' : '');
+    });
     prevBtn.addEventListener('click', function(e) {
       e.stopPropagation();
-      currentCalendarMonth--;
-      if (currentCalendarMonth < 0) { currentCalendarMonth = 11; currentCalendarYear--; }
-      if (currentViewMode === 'range') { rangePhase = 'select-start'; rangeStartDate = null; rangeEndDate = null; }
-      calendarCursorDate = null;
-      renderCalendarContent();
+      if (prevBtn.disabled) return;
+      changeCalendarMonth(-1);
     });
     const monthYear = document.createElement('span');
     monthYear.style.fontWeight = '600';
     monthYear.style.fontSize = '13px';
+    monthYear.title = '使用左右按钮切换页面月份并加载对应用量';
     const updateMonthYear = () => {
       monthYear.textContent = currentCalendarYear + '年 ' + (currentCalendarMonth + 1) + '月';
     };
@@ -1188,16 +1740,51 @@
     nextBtn.textContent = '▶';
     nextBtn.style.cssText = navBtnStyle;
     nextBtn.title = '下个月';
-    nextBtn.addEventListener('mouseenter', function() { nextBtn.style.cssText = navBtnStyle + ';' + navBtnHover; });
-    nextBtn.addEventListener('mouseleave', function() { nextBtn.style.cssText = navBtnStyle; });
+    nextBtn.addEventListener('mouseenter', function() { if (!nextBtn.disabled) nextBtn.style.cssText = navBtnStyle + ';' + navBtnHover; });
+    nextBtn.addEventListener('mouseleave', function() {
+      nextBtn.style.cssText = navBtnStyle + (nextBtn.disabled ? ';opacity:0.22;cursor:not-allowed' : '');
+    });
     nextBtn.addEventListener('click', function(e) {
       e.stopPropagation();
-      currentCalendarMonth++;
-      if (currentCalendarMonth > 11) { currentCalendarMonth = 0; currentCalendarYear++; }
-      if (currentViewMode === 'range') { rangePhase = 'select-start'; rangeStartDate = null; rangeEndDate = null; }
-      calendarCursorDate = null;
-      renderCalendarContent();
+      if (nextBtn.disabled) return;
+      changeCalendarMonth(1);
     });
+
+    function applyNavButtonState(btn, enabled) {
+      btn.disabled = !enabled;
+      btn.style.cssText = navBtnStyle + (enabled ? '' : ';opacity:0.22;cursor:not-allowed');
+    }
+
+    function updateNavButtons() {
+      const hasMonthSelect = !!getUsageMonthSelect();
+      const prevTarget = addMonths(currentCalendarYear, currentCalendarMonth, -1);
+      const nextTarget = addMonths(currentCalendarYear, currentCalendarMonth, 1);
+      applyNavButtonState(prevBtn, !hasMonthSelect || canSelectUsageMonth(prevTarget.year, prevTarget.month));
+      applyNavButtonState(nextBtn, !hasMonthSelect || canSelectUsageMonth(nextTarget.year, nextTarget.month));
+    }
+
+    function changeCalendarMonth(delta) {
+      const target = addMonths(currentCalendarYear, currentCalendarMonth, delta);
+      const hasMonthSelect = !!getUsageMonthSelect();
+      if (hasMonthSelect) {
+        if (!selectUsageMonth(target.year, target.month)) return;
+      } else {
+        currentCalendarYear = target.year;
+        currentCalendarMonth = target.month;
+        calendarCursorDate = null;
+        hideCalendarTooltip();
+        if (currentViewMode === 'range') {
+          rangePhase = 'select-start';
+          rangeStartDate = null;
+          rangeEndDate = null;
+        }
+      }
+      if (currentViewMode === 'week') {
+        weekAutoScrollMonthKey = monthKey(currentCalendarYear, currentCalendarMonth);
+      }
+      renderCalendarContent();
+    }
+
     header.appendChild(prevBtn);
     header.appendChild(monthYear);
     header.appendChild(nextBtn);
@@ -1222,6 +1809,9 @@
               rangeStartDate = null;
               rangeEndDate = null;
             }
+            if (mode === 'week') {
+              weekAutoScrollMonthKey = monthKey(currentCalendarYear, currentCalendarMonth);
+            }
             renderCalendarContent();
           }
         });
@@ -1229,6 +1819,13 @@
       })(tabs[ti]);
     }
     calendarOverlay.appendChild(tabsDiv);
+
+    // 月份切换提示（页面月份 ≠ 显示月份时显示）
+    const monthWarning = document.createElement('div');
+    monthWarning.id = 'ds-month-warning';
+    monthWarning.style.cssText = 'text-align:center;font-size:10px;opacity:0.7;padding:2px 0 6px;display:none';
+    monthWarning.textContent = '';
+    calendarOverlay.appendChild(monthWarning);
 
     const calendarContainer = document.createElement('div');
     calendarContainer.id = 'ds-calendar-grid';
@@ -1319,6 +1916,33 @@
       rangeIndicator.innerHTML = '';
       updateMonthYear();
       updateViewTabs();
+      updateNavButtons();
+
+      // 检测页面月份与接口数据是否已同步到当前日历月份
+      var _pg = getPageMonth();
+      var _warningEl = document.getElementById('ds-month-warning');
+      var _sameAsPageMonth = _pg.year === currentCalendarYear && _pg.month === currentCalendarMonth;
+      var _loadingMonth = isCalendarMonthLoading();
+      if (_warningEl) {
+        if (!_sameAsPageMonth) {
+          _warningEl.textContent = '请使用上方月份按钮加载该月份数据';
+          _warningEl.style.display = 'block';
+        } else if (_loadingMonth) {
+          _warningEl.textContent = '正在加载该月份用量…';
+          _warningEl.style.display = 'block';
+        } else {
+          _warningEl.textContent = '';
+          _warningEl.style.display = 'none';
+        }
+      }
+      if (_loadingMonth) {
+        const loading = document.createElement('div');
+        loading.className = 'ds-no-data';
+        loading.style.padding = '20px 0';
+        loading.textContent = '正在加载该月份用量…';
+        calendarContainer.appendChild(loading);
+        return;
+      }
 
       if (currentViewMode === 'month') {
         renderCalendar(calendarContainer, currentCalendarYear, currentCalendarMonth);
@@ -1350,11 +1974,13 @@
           var summaryDiv = document.createElement('div');
           summaryDiv.className = 'ds-calendar-summary';
           summaryDiv.innerHTML =
-            '<span>范围合计</span>' +
+            '<span style="width:100%">范围合计</span>' +
             '<span>费用 <b>￥' + rangeSummary.totalCost.toFixed(2) + '</b></span>' +
             '<span>Token <b>' + fmtNumShort(rangeSummary.totalTokens) + '</b></span>' +
             '<span>请求 <b>' + rangeSummary.totalRequests.toLocaleString() + '</b></span>' +
-            '<span>Pro ' + fmtNumShort(rangeSummary.proTokens) + ' | Flash ' + fmtNumShort(rangeSummary.flashTokens) + '</span>' +
+            '<span class="ds-sum-break"></span>' +
+            '<span>Pro ' + fmtNumShort(rangeSummary.proTokens) + '</span>' +
+            '<span>Flash ' + fmtNumShort(rangeSummary.flashTokens) + '</span>' +
             '<span>天数 ' + rangeSummary.dayCount + '</span>' +
             '<span>缓存 <b>' + (rangeSummary.overallHitRate !== null ? rangeSummary.overallHitRate.toFixed(1) + '%' : '—') + '</b></span>';
           calendarContainer.appendChild(summaryDiv);
@@ -1393,6 +2019,10 @@
       if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
         e.preventDefault();
         e.stopPropagation();
+        if (currentViewMode === 'month') {
+          changeCalendarMonth(e.key === 'ArrowRight' ? 1 : -1);
+          return;
+        }
 
         if (!calendarCursorDate) {
           // 首次按键：从当天或当月首日开始
