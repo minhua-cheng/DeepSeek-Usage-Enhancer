@@ -1,9 +1,10 @@
+// Based on deepseek-usage-monitor.js by Jmkwang
 // ==UserScript==
 // @name         DeepSeek 每日用量监控
 // @namespace    https://github.com/local/deepseek-usage-monitor
 // @version      1.4.1
 // @description  拦截 DeepSeek 开放平台用量 API，在小窗口中展示完整数据，支持日历查看历史每日用量（纯本地，无远程通信）
-// @author       Jmkwang
+// @author       minhua-cheng
 // @match        https://platform.deepseek.com/usage*
 // @run-at       document-start
 // @grant        none
@@ -519,6 +520,8 @@
     .ds-sum-val { color: #a6adc8; }
     .ds-summary-dot { background: #45475a; }
     .ds-no-data { color: #585b70; }
+    #ds-monitor-panel.ds-collapsed .ds-body,
+    #ds-monitor-panel.ds-collapsed .ds-summary-bar { display: none; }
     .ds-calendar { background: rgba(30, 30, 46, 0.96); border: 1px solid rgba(255,255,255,0.1); }
     .ds-calendar th { color: #6c7086; }
     .ds-calendar-day { color: #cdd6f4; }
@@ -563,6 +566,8 @@
     .ds-sum-val { color: #1e1e2e; }
     .ds-summary-dot { background: #c0c2ce; }
     .ds-no-data { color: #9ca0b0; }
+    #ds-monitor-panel.ds-collapsed .ds-body,
+    #ds-monitor-panel.ds-collapsed .ds-summary-bar { display: none; }
     .ds-calendar { background: rgba(245, 245, 250, 0.96); border: 1px solid rgba(0,0,0,0.1); }
     .ds-calendar th { color: #7c7f8a; }
     .ds-calendar-day { color: #1e1e2e; }

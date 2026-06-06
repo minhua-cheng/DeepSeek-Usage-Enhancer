@@ -1,115 +1,31 @@
 # DeepSeek Usage Enhancer
 
-在 DeepSeek 开放平台用量页面补全**今日数据**——今日消费、请求次数、Token 用量、缓存命中率，并提供图表数字千分位格式化。
+> Forked from [Jmkwang/DeepSeek-Usage-Enhancer](https://github.com/Jmkwang/DeepSeek-Usage-Enhancer)
 
----
+在 DeepSeek 用量页面自动补全今日消费、请求次数、Token 用量、缓存命中率。
 
-## 背景
+## 版本
 
-打开 [platform.deepseek.com/usage](https://platform.deepseek.com/usage)，官方页面默认只展示**本月累计**数据。想看"今天花了多少钱""今天请求了多少次""缓存命中率是多少"，需要手动点图表柱子、切换日期、自己算。
-
-本项目的脚本帮你自动补齐这些信息。
-
----
-
-## 两个版本
-
-| 版本 | 文件 | 方式 |
+| 版本 | 文件 | 特点 |
 |------|------|------|
-| **页面注入版** | `DeepSeek-Usage-Enhancer.js` | 将数据注入页面原有布局，像原生功能 |
-| **悬浮面板版** | `deepseek-usage-monitor.js` | 独立浮窗展示，可拖拽可折叠 |
-
-两个版本功能相同，选一个安装即可。**功能比较**：
-
-| 特性 | 页面注入版 | 悬浮面板版 |
-|------|:---:|:---:|
-| 今日消费 | ✓ | ✓ |
-| 各模型请求数 / Token / 缓存命中率 | ✓ | ✓ |
-| 图表悬停数字千分位 | ✓ | — |
-| 自由拖拽 / 折叠 | — | ✓ |
-| 数值点击切换短格式↔原始值 | — | ✓ |
-| 不受页面 React 重绘影响 | 自动重注入 | 独立 DOM，天然不受影响 |
-
----
+| **页面注入版** | `DeepSeek-Usage-Enhancer.js` | 数据注入页面布局，像原生功能 |
+| **悬浮面板版** | `deepseek-usage-monitor.js` | 独立浮窗，可拖拽折叠 |
+| **悬浮面板版（中文）** | `deepseek-usage-monitor-zh.js` | 悬浮面板版的中文本地化版本 |
 
 ## 安装
 
-1. 安装浏览器用户脚本管理器：
-   - [Tampermonkey](https://www.tampermonkey.net/)（Chrome / Edge / Firefox）
+1. 安装 [Tampermonkey](https://www.tampermonkey.net/)
+2. 新建脚本，粘贴对应 `.js` 文件内容，保存
+3. 打开 [DeepSeek 用量页面](https://platform.deepseek.com/usage) 即可
 
-2. 点击管理器「添加新脚本」，将对应 `.js` 文件的全部内容粘贴进去，保存。
+## 原理
 
-3. 打开 [DeepSeek 用量页面](https://platform.deepseek.com/usage)，脚本自动生效。
+拦截页面 API 请求（`window.fetch` + `XMLHttpRequest`），在浏览器本地处理数据，不向第三方发送。
 
----
+## 安全
 
-## 功能详情
-
-
-### 页面注入版（`DeepSeek-Usage-Enhancer.js`）
-
-安装后打开用量页面，你会看到：
-
-- **「今日消费」卡片** — 紧挨着官方「本月消费」卡片，显示今天的消费金额（CNY）。
-- **今日/昨日请求次数** — 在每个模型的「API 请求次数」下方，追加昨天和今天的请求量。
-- **今日总 Tokens + 缓存命中率** — 在「Tokens」区域下方展示今日 Token 总量和缓存命中率。
-- **图表悬停数字千分位** — 鼠标悬停图表时，4 位以上数字自动加逗号分隔（如 `1234567` → `1,234,567`）。
-
-> 页面是 React 渲染的，脚本持续监听 DOM 变化，重绘后自动重新注入。
->
-> 
-
-### 悬浮面板版（`deepseek-usage-monitor.js`）
-
-安装后页面右下角会出现一个深色浮窗面板：
-
-- **账户余额** — 充值余额、本月消费、今日消费。
-- **各模型详情块** — `deepseek-v4-pro` 和 `deepseek-v4-Flash` 的请求数、总 Token、缓存命中/未命中/输出 Token、缓存命中率。
-- **底部状态栏** — 汇总总 Token 和总请求数。
-- **拖拽移动** — 拖动标题栏即可移动面板，位置自动保存到 localStorage。
-- **折叠/展开** — 点击标题栏按钮收起面板。
-- **数值切换** — 点击任意数字在短格式（`1.5K`）和原始值（`1,500`）之间切换。
-
-<img width="2033" height="1754" alt="image" src="https://github.com/user-attachments/assets/105d5f99-ff93-47b4-b490-780269ed8a11" />
-
----
-
-## 原理简介
-
-两个脚本通过拦截页面发起的三个 API 请求获取原始数据：
-
-| API | 用途 |
-|-----|------|
-| `GET /api/v0/users/get_user_summary` | 账户余额与本月消费 |
-| `GET /api/v0/usage/amount` | 各模型的 Token/请求用量 |
-| `GET /api/v0/usage/cost` | 每日费用明细 |
-
-拦截方式：`window.fetch` 和 `XMLHttpRequest` 的双重 monkey-patch，确保覆盖所有请求方式。
-
-数据完全在浏览器本地处理，不向任何第三方发送。
-
----
-
-## 安全说明
-
-- 纯本地运行，无远程通信，`@grant none`。
-- 源代码未压缩混淆，可逐行审查。
-- 「页面注入版」约 650 行，「悬浮面板版」约 680 行。
-
----
-
-## 更新日志
-
-### v1.2.0
-- 页面注入版：长轮询间隔从 10s 缩短至 3s，页面重绘后响应更快。
-
-### v1.1.0
-- 新增悬浮面板版 `deepseek-usage-monitor.js`，支持拖拽、折叠、数值格式切换。
-
-### v1.0.0
-- 首次发布页面注入版：今日消费卡片、模型请求/Token/缓存命中率、图表千分位。
-
----
+- 纯本地运行，`@grant none`，无远程通信
+- 源代码可逐行审查
 
 ## 许可
 
