@@ -514,7 +514,7 @@
   function fmtMoney(n) {
     if (n === undefined || n === null) return '—';
     const val = Math.floor(Number(n) * 100) / 100;
-    return '¥' + val.toFixed(2);
+    return '￥' + val.toFixed(2);
   }
 
   function fmtPercent(n) {
@@ -884,7 +884,7 @@
     }
     const div = document.createElement('div');
     div.className = 'ds-calendar-summary';
-    const unit = rawUserSummary && rawUserSummary.balance && rawUserSummary.balance.currency === 'CNY' ? '¥' : '$';
+    const unit = rawUserSummary ? (transformUserSummary(rawUserSummary).balance.currency === 'CNY' ? '￥' : '$') : '￥';
     div.innerHTML =
       '<span>(' + (month + 1) + '月) 合计</span>' +
       '<span>费用 <b>' + unit + totalCost.toFixed(2) + '</b></span>' +
@@ -1388,7 +1388,7 @@
     if (extraClass) val.classList.add(extraClass);
     if (n !== undefined && n !== null && typeof n === 'number') {
       if (isMoney) {
-        val.textContent = '¥' + n.toFixed(2);
+        val.textContent = '￥' + n.toFixed(2);
       } else {
         val.setAttribute('data-short', fmtNumShort(n));
         val.setAttribute('data-raw', fmtNumRaw(n));
