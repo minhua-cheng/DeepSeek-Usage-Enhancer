@@ -306,11 +306,20 @@
     }
   }
 
+  // 已主动抓取的月份数据缓存（跨月数据）
+  // 结构: Map<monthStr, { amount: bizData, cost: bizData }>
+  let fetchedMonthCache = new Map();
+
   // 综合更新每日数据缓存
   function rebuildDailyData() {
     dailyDataMap.clear();
     if (rawUsageAmount) updateDailyDataFromAmount(rawUsageAmount);
     if (rawUsageCost) updateDailyDataFromCost(rawUsageCost);
+    // 合并已抓取的跨月数据
+    for (const [monthStr, cache] of fetchedMonthCache.entries()) {
+      if (cache.amount) updateDailyDataFromAmount(cache.amount);
+      if (cache.cost) updateDailyDataFromCost(cache.cost);
+    }
     // 重新计算每条记录的总体命中率（基于模型的总输入）
     for (const [date, dayData] of dailyDataMap.entries()) {
       let totalCached = 0, totalInput = 0;
@@ -322,6 +331,39 @@
       }
       dayData.overallHitRate = totalInput > 0 ? (totalCached / totalInput) * 100 : null;
     }
+  }
+
+  // 主动抓取指定月份的数据
+  function fetchMonthData(year, month) {
+    var monthStr = year + '-' + String(month + 1).padStart(2, '0');
+    if (fetchedMonthCache.has(monthStr)) return Promise.resolve(false);
+    if (!bearerToken) return Promise.resolve(false);
+
+    var base = window.location.origin;
+    var headers = { 'Authorization': 'Bearer ' + bearerToken, 'Accept': 'application/json' };
+    var cache = {};
+
+    return Promise.all([
+      origFetch(base + '/api/v0/usage/amount?month=' + monthStr, { headers })
+        .then(function(r) { return r.ok ? r.json() : Promise.reject(); })
+        .then(function(json) {
+          var data = extractBizData(json);
+          if (data) cache.amount = data;
+        }).catch(function() { /* 忽略单个请求失败 */ }),
+      origFetch(base + '/api/v0/usage/cost?month=' + monthStr, { headers })
+        .then(function(r) { return r.ok ? r.json() : Promise.reject(); })
+        .then(function(json) {
+          var data = extractBizData(json);
+          if (data) cache.cost = data;
+        }).catch(function() { /* 忽略单个请求失败 */ })
+    ]).then(function() {
+      if (cache.amount || cache.cost) {
+        fetchedMonthCache.set(monthStr, cache);
+        rebuildDailyData();
+        return true;
+      }
+      return false;
+    });
   }
 
   // ============================================================
@@ -907,7 +949,8 @@
         currentCalendarMonth = 11;
         currentCalendarYear--;
       }
-      renderCalendarContent();
+      var _y = currentCalendarYear, _m = currentCalendarMonth;
+      fetchMonthData(_y, _m).then(function() { renderCalendarContent(); }).catch(function() { renderCalendarContent(); });
     });
     const monthYear = document.createElement('span');
     monthYear.style.fontWeight = '600';
@@ -927,7 +970,8 @@
         currentCalendarMonth = 0;
         currentCalendarYear++;
       }
-      renderCalendarContent();
+      var _y = currentCalendarYear, _m = currentCalendarMonth;
+      fetchMonthData(_y, _m).then(function() { renderCalendarContent(); }).catch(function() { renderCalendarContent(); });
     });
     const leftGroup = document.createElement('div');
     leftGroup.style.display = 'flex';
@@ -942,7 +986,8 @@
       const now = new Date();
       currentCalendarYear = now.getFullYear();
       currentCalendarMonth = now.getMonth();
-      renderCalendarContent();
+      var _y = currentCalendarYear, _m = currentCalendarMonth;
+      fetchMonthData(_y, _m).then(function() { renderCalendarContent(); }).catch(function() { renderCalendarContent(); });
     });
     leftGroup.appendChild(todayBtn);
     header.appendChild(leftGroup);
