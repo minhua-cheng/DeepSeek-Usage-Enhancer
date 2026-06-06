@@ -41,6 +41,18 @@
       String(d.getUTCDate()).padStart(2, '0');
   }
 
+  // 将 Date 对象格式化为本地时区的 YYYY-MM-DD（匹配 API 返回的日期格式）
+  function localDateStr(d) {
+    return d.getFullYear() + '-' +
+      String(d.getMonth() + 1).padStart(2, '0') + '-' +
+      String(d.getDate()).padStart(2, '0');
+  }
+
+  function localToday() {
+    const d = new Date();
+    return localDateStr(d);
+  }
+
   function safeJSON(text) {
     try { return JSON.parse(text); } catch { return null; }
   }
@@ -306,20 +318,11 @@
     }
   }
 
-  // 已主动抓取的月份数据缓存（跨月数据）
-  // 结构: Map<monthStr, { amount: bizData, cost: bizData }>
-  let fetchedMonthCache = new Map();
-
   // 综合更新每日数据缓存
   function rebuildDailyData() {
     dailyDataMap.clear();
     if (rawUsageAmount) updateDailyDataFromAmount(rawUsageAmount);
     if (rawUsageCost) updateDailyDataFromCost(rawUsageCost);
-    // 合并已抓取的跨月数据
-    for (const [monthStr, cache] of fetchedMonthCache.entries()) {
-      if (cache.amount) updateDailyDataFromAmount(cache.amount);
-      if (cache.cost) updateDailyDataFromCost(cache.cost);
-    }
     // 重新计算每条记录的总体命中率（基于模型的总输入）
     for (const [date, dayData] of dailyDataMap.entries()) {
       let totalCached = 0, totalInput = 0;
@@ -331,39 +334,6 @@
       }
       dayData.overallHitRate = totalInput > 0 ? (totalCached / totalInput) * 100 : null;
     }
-  }
-
-  // 主动抓取指定月份的数据
-  function fetchMonthData(year, month) {
-    var monthStr = year + '-' + String(month + 1).padStart(2, '0');
-    if (fetchedMonthCache.has(monthStr)) return Promise.resolve(false);
-    if (!bearerToken) return Promise.resolve(false);
-
-    var base = window.location.origin;
-    var headers = { 'Authorization': 'Bearer ' + bearerToken, 'Accept': 'application/json' };
-    var cache = {};
-
-    return Promise.all([
-      origFetch(base + '/api/v0/usage/amount?month=' + monthStr, { headers })
-        .then(function(r) { return r.ok ? r.json() : Promise.reject(); })
-        .then(function(json) {
-          var data = extractBizData(json);
-          if (data) cache.amount = data;
-        }).catch(function() { /* 忽略单个请求失败 */ }),
-      origFetch(base + '/api/v0/usage/cost?month=' + monthStr, { headers })
-        .then(function(r) { return r.ok ? r.json() : Promise.reject(); })
-        .then(function(json) {
-          var data = extractBizData(json);
-          if (data) cache.cost = data;
-        }).catch(function() { /* 忽略单个请求失败 */ })
-    ]).then(function() {
-      if (cache.amount || cache.cost) {
-        fetchedMonthCache.set(monthStr, cache);
-        rebuildDailyData();
-        return true;
-      }
-      return false;
-    });
   }
 
   // ============================================================
@@ -464,6 +434,16 @@
     }
     // 每次收到新数据，重新构建每日缓存
     rebuildDailyData();
+    // 如果日历已打开，自动刷新为当前数据的月份
+    if (calendarOverlay && calendarOverlay.style.display === 'block') {
+      updateCalendarMonthFromData();
+      // 重置范围选择状态（月份变了，旧范围失效）
+      rangePhase = 'idle';
+      rangeStartDate = null;
+      rangeEndDate = null;
+      calendarCursorDate = null;
+      if (calendarRefreshFn) calendarRefreshFn();
+    }
     const payload = buildOutputPayload();
     if (payload) {
       if (currentView === 'today') {
@@ -564,7 +544,7 @@
     .ds-no-data { color: #585b70; }
     #ds-monitor-panel.ds-collapsed .ds-body,
     #ds-monitor-panel.ds-collapsed .ds-summary-bar { display: none; }
-    .ds-calendar { background: rgba(30, 30, 46, 0.96); border: 1px solid rgba(255,255,255,0.1); }
+    .ds-calendar { background: rgba(30, 30, 46, 0.96); border: 1px solid rgba(255,255,255,0.1); color: #cdd6f4; }
     .ds-calendar th { color: #6c7086; }
     .ds-calendar-day { color: #cdd6f4; }
     .ds-calendar-day.other-month { color: #585b70; }
@@ -584,6 +564,28 @@
     @keyframes ds-calendar-in { from { opacity: 0; transform: scale(0.96) translateY(-4px); } to { opacity: 1; transform: scale(1) translateY(0); } }
     .ds-calendar { animation: ds-calendar-in 0.15s ease-out; }
     .ds-calendar-day { transition: background 0.12s, color 0.12s, transform 0.12s; }
+    .ds-view-tabs { display: flex; gap: 2px; margin-bottom: 10px; }
+    .ds-view-tab { flex: 1; padding: 4px 0; border: none; background: none; cursor: pointer; font-size: 11px; border-radius: 4px; color: #6c7086; transition: background 0.12s, color 0.12s; }
+    .ds-view-tab.active { background: rgba(137,180,250,0.2); color: #89b4fa; font-weight: 600; }
+    .ds-view-tab:hover:not(.active) { background: rgba(255,255,255,0.05); }
+    .ds-week-grid { display: flex; flex-direction: column; gap: 0; }
+    .ds-week-row { display: grid; grid-template-columns: repeat(7, 1fr); gap: 1px; }
+    .ds-week-cell { text-align: center; padding: 3px 2px; border-radius: 4px; font-size: 11px; cursor: pointer; color: #cdd6f4; transition: background 0.12s; }
+    .ds-week-cell.other-week { opacity: 0.3; }
+    .ds-week-cell.has-data { background: rgba(137,180,250,0.2); font-weight: 600; }
+    .ds-week-cell:hover { background: rgba(137,180,250,0.35); }
+    .ds-week-cell.today { box-shadow: inset 0 0 0 1.5px #89b4fa; }
+    .ds-week-label { font-size: 9px; opacity: 0.5; margin: 6px 0 1px; }
+    .ds-week-summary { font-size: 9px; opacity: 0.5; text-align: right; margin-bottom: 4px; padding-top: 2px; border-top: 1px solid rgba(255,255,255,0.06); }
+    .ds-range-indicator { font-size: 10px; text-align: center; opacity: 0.7; margin-bottom: 6px; min-height: 16px; }
+    .ds-range-clear { font-size: 10px; cursor: pointer; text-align: center; opacity: 0.6; margin-top: 2px; }
+    .ds-range-clear:hover { opacity: 1; color: #89b4fa; }
+    .ds-calendar-day.range-start { background: #89b4fa !important; color: #1e1e2e !important; border-radius: 4px 0 0 4px !important; }
+    .ds-calendar-day.range-end { background: #89b4fa !important; color: #1e1e2e !important; border-radius: 0 4px 4px 0 !important; }
+    .ds-calendar-day.range-mid { background: rgba(137, 180, 250, 0.50) !important; color: #1e1e2e !important; border-radius: 0 !important; }
+    .ds-calendar-day.range-start:hover,
+    .ds-calendar-day.range-end:hover { background: #89b4fa !important; }
+    .ds-calendar-day.range-mid:hover { background: rgba(137, 180, 250, 0.65) !important; }
   `;
 
   const lightThemeStyle = `
@@ -623,7 +625,7 @@
     .ds-no-data { color: #9ca0b0; }
     #ds-monitor-panel.ds-collapsed .ds-body,
     #ds-monitor-panel.ds-collapsed .ds-summary-bar { display: none; }
-    .ds-calendar { background: rgba(245, 245, 250, 0.96); border: 1px solid rgba(0,0,0,0.1); }
+    .ds-calendar { background: rgba(245, 245, 250, 0.96); border: 1px solid rgba(0,0,0,0.1); color: #1e1e2e; }
     .ds-calendar th { color: #7c7f8a; }
     .ds-calendar-day { color: #1e1e2e; }
     .ds-calendar-day.other-month { color: #9ca0b0; }
@@ -643,6 +645,29 @@
     @keyframes ds-calendar-in { from { opacity: 0; transform: scale(0.96) translateY(-4px); } to { opacity: 1; transform: scale(1) translateY(0); } }
     .ds-calendar { animation: ds-calendar-in 0.15s ease-out; }
     .ds-calendar-day { transition: background 0.12s, color 0.12s, transform 0.12s; }
+    .ds-view-tabs { display: flex; gap: 2px; margin-bottom: 10px; }
+    .ds-view-tab { flex: 1; padding: 4px 0; border: none; background: none; cursor: pointer; font-size: 11px; border-radius: 4px; color: #7c7f8a; transition: background 0.12s, color 0.12s; }
+    .ds-view-tab.active { background: rgba(30,102,245,0.12); color: #1e66f5; font-weight: 600; }
+    .ds-view-tab:hover:not(.active) { background: rgba(0,0,0,0.04); }
+    .ds-week-grid { display: flex; flex-direction: column; gap: 0; }
+    .ds-week-row { display: grid; grid-template-columns: repeat(7, 1fr); gap: 1px; }
+    .ds-week-cell { text-align: center; padding: 3px 2px; border-radius: 4px; font-size: 11px; cursor: pointer; color: #1e1e2e; transition: background 0.12s; }
+    .ds-week-cell.other-week { opacity: 0.3; }
+    .ds-week-cell.has-data { background: rgba(30,102,245,0.15); font-weight: 600; }
+    .ds-week-cell:hover { background: rgba(30,102,245,0.25); }
+    .ds-week-cell.today { box-shadow: inset 0 0 0 1.5px #1e66f5; }
+    .ds-week-label { font-size: 9px; opacity: 0.5; margin: 6px 0 1px; }
+    .ds-week-summary { font-size: 9px; opacity: 0.5; text-align: right; margin-bottom: 4px; padding-top: 2px; border-top: 1px solid rgba(0,0,0,0.08); }
+    .ds-range-indicator { font-size: 10px; text-align: center; opacity: 0.7; margin-bottom: 6px; min-height: 16px; }
+    .ds-range-clear { font-size: 10px; cursor: pointer; text-align: center; opacity: 0.6; margin-top: 2px; }
+    .ds-range-clear:hover { opacity: 1; color: #1e66f5; }
+    .ds-calendar-day.range-start { background: #1e66f5 !important; color: #ffffff !important; border-radius: 4px 0 0 4px !important; }
+    .ds-calendar-day.range-end { background: #1e66f5 !important; color: #ffffff !important; border-radius: 0 4px 4px 0 !important; }
+    .ds-calendar-day.range-mid { background: rgba(30, 102, 245, 0.40) !important; color: #ffffff !important; border-radius: 0 !important; }
+    .ds-calendar-day.range-start:hover,
+    .ds-calendar-day.range-end:hover { background: #1e66f5 !important; }
+    .ds-calendar-day.range-mid:hover { background: rgba(30, 102, 245, 0.55) !important; }
+    .ds-calendar-day.range-mid:hover { background: rgba(30, 102, 245, 0.40) !important; }
   `;
 
   let currentTheme = 'dark';
@@ -697,6 +722,34 @@
   let calendarOverlay = null;
   let currentCalendarYear = new Date().getFullYear();
   let currentCalendarMonth = new Date().getMonth(); // 0-11
+
+  // 日历视图模式: 'month' | 'week' | 'range'
+  let currentViewMode = 'month';
+
+  // 范围选择状态
+  let rangePhase = 'idle'; // 'idle' | 'select-start' | 'select-end' | 'done'
+  let rangeStartDate = null; // 'YYYY-MM-DD' | null
+  let rangeEndDate = null;
+
+  // 日历刷新回调（由 showCalendar 注册，processApiResponse 调用）
+  let calendarRefreshFn = null;
+
+  // 日历键盘光标
+  let calendarCursorDate = null;
+
+  // 从页面数据中获取当前显示的月份
+  function updateCalendarMonthFromData() {
+    if (rawUsageAmount && rawUsageAmount.days && rawUsageAmount.days.length > 0) {
+      var firstDate = rawUsageAmount.days[0].date;
+      var parts = firstDate.split('-');
+      currentCalendarYear = parseInt(parts[0]);
+      currentCalendarMonth = parseInt(parts[1]) - 1;
+    } else {
+      var now = new Date();
+      currentCalendarYear = now.getFullYear();
+      currentCalendarMonth = now.getMonth();
+    }
+  }
 
   // 显示某个日期的详情
   function showDateDetail(dateStr) {
@@ -780,20 +833,24 @@
       for (let j = 0; j < 7; j++) {
         const cell = days[i + j];
         const td = document.createElement('td');
+        td.setAttribute('data-date', localDateStr(cell.date));
         td.style.textAlign = 'center';
         td.style.padding = '2px 0';
         const daySpan = document.createElement('span');
         daySpan.textContent = cell.date.getDate();
         daySpan.className = 'ds-calendar-day';
         if (!cell.isCurrentMonth) daySpan.classList.add('other-month');
-        const dateStr = cell.date.toISOString().slice(0, 10);
+        const dateStr = localDateStr(cell.date);
         if (dailyDataMap.has(dateStr) && cell.isCurrentMonth) {
           daySpan.classList.add('has-data');
         }
         if (selectedDate === dateStr && cell.isCurrentMonth) {
           daySpan.classList.add('selected');
         }
-        if (dateStr === utcToday() && cell.isCurrentMonth) {
+        if (calendarCursorDate === dateStr && cell.isCurrentMonth && calendarOverlay && calendarOverlay.style.display === 'block') {
+          daySpan.classList.add('selected');
+        }
+        if (dateStr === localToday() && cell.isCurrentMonth) {
           daySpan.classList.add('today');
         }
         daySpan.style.cursor = 'pointer';
@@ -805,7 +862,6 @@
           e.stopPropagation();
           if (cell.isCurrentMonth) {
             showDateDetail(dateStr);
-            closeCalendar();
           }
         });
         td.appendChild(daySpan);
@@ -814,7 +870,7 @@
           const costEl = document.createElement('span');
           costEl.className = 'ds-calendar-cost';
           const amt = dayData.totalCost || 0;
-          costEl.textContent = amt < 100 ? amt.toFixed(1) : Math.round(amt).toString();
+          costEl.textContent = '￥' + (amt < 100 ? amt.toFixed(1) : Math.round(amt).toString());
           td.appendChild(costEl);
           daySpan.addEventListener('mouseenter', (e) => { showCalendarTooltip(e, dayData); });
           daySpan.addEventListener('mouseleave', () => { hideCalendarTooltip(); });
@@ -873,6 +929,7 @@
 
   function buildMonthlySummary(year, month) {
     let totalCost = 0, totalTokens = 0, totalRequests = 0, dayCount = 0;
+    let proTokens = 0, flashTokens = 0;
     for (const [dateStr, dayData] of dailyDataMap.entries()) {
       const parts = dateStr.split('-');
       if (parseInt(parts[0]) === year && parseInt(parts[1]) - 1 === month) {
@@ -880,18 +937,188 @@
         totalTokens += dayData.totalTokens || 0;
         totalRequests += dayData.totalRequests || 0;
         dayCount++;
+        if (dayData.models) {
+          for (const modelName of Object.keys(dayData.models)) {
+            const m = dayData.models[modelName];
+            const tokens = m.tokens ? (m.tokens.total || 0) : 0;
+            const lower = modelName.toLowerCase();
+            if (lower.includes('pro')) proTokens += tokens;
+            else if (lower.includes('flash')) flashTokens += tokens;
+          }
+        }
       }
     }
     const div = document.createElement('div');
     div.className = 'ds-calendar-summary';
-    const unit = rawUserSummary ? (transformUserSummary(rawUserSummary).balance.currency === 'CNY' ? '￥' : '$') : '￥';
     div.innerHTML =
       '<span>(' + (month + 1) + '月) 合计</span>' +
-      '<span>费用 <b>' + unit + totalCost.toFixed(2) + '</b></span>' +
+      '<span>费用 <b>￥' + totalCost.toFixed(2) + '</b></span>' +
       '<span>Token <b>' + fmtNumShort(totalTokens) + '</b></span>' +
       '<span>请求 <b>' + totalRequests.toLocaleString() + '</b></span>' +
+      '<span>Pro ' + fmtNumShort(proTokens) + ' | Flash ' + fmtNumShort(flashTokens) + '</span>' +
       '<span>天数 ' + dayCount + '</span>';
     return div;
+  }
+
+  // 返回 dateStr 所在周的周一（'YYYY-MM-DD'）
+  function getWeekMonday(dateStr) {
+    const d = new Date(dateStr + 'T00:00:00Z');
+    const day = d.getUTCDay(); // 0=Sun, 6=Sat
+    const diff = day === 0 ? -6 : 1 - day; // 周日 → 前推6天，其他 → 回退到周一
+    d.setUTCDate(d.getUTCDate() + diff);
+    return d.toISOString().slice(0, 10);
+  }
+
+  // 获取某个月所涉及的所有周的周一日期数组
+  function getWeeksForMonth(year, month) {
+    const firstDay = new Date(Date.UTC(year, month, 1));
+    const lastDay = new Date(Date.UTC(year, month + 1, 0));
+    const startMonday = getWeekMonday(firstDay.toISOString().slice(0, 10));
+    const weeks = [];
+    const current = new Date(startMonday + 'T00:00:00Z');
+    while (current <= lastDay || weeks.length === 0) {
+      weeks.push(current.toISOString().slice(0, 10));
+      current.setUTCDate(current.getUTCDate() + 7);
+    }
+    // 如果最后一周包含下个月天数，仍然保留
+    const lastMonday = getWeekMonday(lastDay.toISOString().slice(0, 10));
+    if (weeks[weeks.length - 1] !== lastMonday) {
+      weeks.push(lastMonday);
+    }
+    return weeks;
+  }
+
+  // 聚合指定周的数据
+  function buildWeeklySummary(weekMonday) {
+    const start = new Date(weekMonday + 'T00:00:00Z');
+    const end = new Date(start);
+    end.setUTCDate(end.getUTCDate() + 7);
+    let totalCost = 0, totalTokens = 0, totalRequests = 0, dayCount = 0;
+    for (const [dateStr, dayData] of dailyDataMap.entries()) {
+      const d = new Date(dateStr + 'T00:00:00Z');
+      if (d >= start && d < end) {
+        totalCost += dayData.totalCost || 0;
+        totalTokens += dayData.totalTokens || 0;
+        totalRequests += dayData.totalRequests || 0;
+        dayCount++;
+      }
+    }
+    // 聚合缓存命中率（加权平均）
+    let overallHitRate = null;
+    let totalHits = 0, totalMisses = 0;
+    for (const [dateStr, dayData] of dailyDataMap.entries()) {
+      const d = new Date(dateStr + 'T00:00:00Z');
+      if (d >= start && d < end && dayData.models) {
+        for (const modelName of Object.keys(dayData.models)) {
+          const m = dayData.models[modelName];
+          if (m.cache_hit_tokens !== undefined) totalHits += m.cache_hit_tokens;
+          if (m.cache_miss_tokens !== undefined) totalMisses += m.cache_miss_tokens;
+        }
+      }
+    }
+    const total = totalHits + totalMisses;
+    if (total > 0) overallHitRate = (totalHits / total) * 100;
+
+    return { totalCost, totalTokens, totalRequests, dayCount, overallHitRate };
+  }
+
+  // 聚合指定日期范围的数据
+  function buildRangeSummary(startDateStr, endDateStr) {
+    const start = new Date(startDateStr + 'T00:00:00Z');
+    const endDate = new Date(endDateStr + 'T00:00:00Z');
+    endDate.setUTCDate(endDate.getUTCDate() + 1); // 包含结束日
+    let totalCost = 0, totalTokens = 0, totalRequests = 0, dayCount = 0;
+    let totalHits = 0, totalMisses = 0;
+    let proTokens = 0, flashTokens = 0;
+    for (const [dateStr, dayData] of dailyDataMap.entries()) {
+      const d = new Date(dateStr + 'T00:00:00Z');
+      if (d >= start && d < endDate) {
+        totalCost += dayData.totalCost || 0;
+        totalTokens += dayData.totalTokens || 0;
+        totalRequests += dayData.totalRequests || 0;
+        dayCount++;
+        if (dayData.models) {
+          for (const modelName of Object.keys(dayData.models)) {
+            const m = dayData.models[modelName];
+            if (m.cache_hit_tokens !== undefined) totalHits += m.cache_hit_tokens;
+            if (m.cache_miss_tokens !== undefined) totalMisses += m.cache_miss_tokens;
+            const tokens = m.tokens ? (m.tokens.total || 0) : 0;
+            const lower = modelName.toLowerCase();
+            if (lower.includes('pro')) proTokens += tokens;
+            else if (lower.includes('flash')) flashTokens += tokens;
+          }
+        }
+      }
+    }
+    let overallHitRate = null;
+    const totalCache = totalHits + totalMisses;
+    if (totalCache > 0) overallHitRate = (totalHits / totalCache) * 100;
+    return { totalCost, totalTokens, totalRequests, dayCount, overallHitRate, proTokens, flashTokens };
+  }
+
+  // 渲染周视图
+  function renderWeekView(container, year, month) {
+    const weeks = getWeeksForMonth(year, month);
+    const grid = document.createElement('div');
+    grid.className = 'ds-week-grid';
+
+    for (let wi = 0; wi < weeks.length; wi++) {
+      const weekStart = new Date(weeks[wi] + 'T00:00:00Z');
+      const weekLabel = document.createElement('div');
+      weekLabel.className = 'ds-week-label';
+      const startM = weekStart.getUTCMonth() + 1;
+      const startD = weekStart.getUTCDate();
+      const weekEnd = new Date(weekStart);
+      weekEnd.setUTCDate(weekEnd.getUTCDate() + 6);
+      const endM = weekEnd.getUTCMonth() + 1;
+      const endD = weekEnd.getUTCDate();
+      weekLabel.textContent = startM + '/' + startD + ' — ' + endM + '/' + endD;
+      grid.appendChild(weekLabel);
+
+      const row = document.createElement('div');
+      row.className = 'ds-week-row';
+      for (let di = 0; di < 7; di++) {
+        const d = new Date(weekStart);
+        d.setUTCDate(d.getUTCDate() + di);
+        const dateStr = d.toISOString().slice(0, 10);
+        const cell = document.createElement('span');
+        cell.className = 'ds-week-cell';
+        cell.textContent = d.getUTCDate();
+        if (d.getUTCMonth() !== month) cell.classList.add('other-week');
+        if (dailyDataMap.has(dateStr)) cell.classList.add('has-data');
+        if (dateStr === localToday()) cell.classList.add('today');
+        if (selectedDate === dateStr && d.getUTCMonth() === month) cell.classList.add('selected');
+        cell.title = dateStr;
+        cell.addEventListener('click', function(e) {
+          e.stopPropagation();
+          if (dailyDataMap.has(dateStr)) {
+            showDateDetail(dateStr);
+          }
+        });
+        cell.addEventListener('mouseenter', function(e) {
+          const dayData = dailyDataMap.get(dateStr);
+          if (dayData) showCalendarTooltip(e, dayData);
+        });
+        cell.addEventListener('mouseleave', function() { hideCalendarTooltip(); });
+        row.appendChild(cell);
+      }
+      grid.appendChild(row);
+
+      // 周合计
+      const summary = buildWeeklySummary(weeks[wi]);
+      if (summary.dayCount > 0) {
+        const unit = rawUserSummary ? (transformUserSummary(rawUserSummary).balance.currency === 'CNY' ? '￥' : '$') : '￥';
+        const totalEl = document.createElement('div');
+        totalEl.className = 'ds-week-summary';
+        totalEl.textContent = '合计 ' + unit + summary.totalCost.toFixed(2) + ' | Token ' + fmtNumShort(summary.totalTokens) + ' | 请求 ' + summary.totalRequests.toLocaleString();
+        grid.appendChild(totalEl);
+      }
+    }
+
+    // 整月合计
+    const monthSummary = buildMonthlySummary(year, month);
+    grid.appendChild(monthSummary);
+    container.appendChild(grid);
   }
 
   function createCalendarOverlay() {
@@ -901,7 +1128,6 @@
     overlay.style.cssText = `
       position: fixed;
       z-index: 100000;
-      background: inherit;
       border-radius: 12px;
       box-shadow: 0 12px 32px rgba(0,0,0,0.35);
       padding: 12px;
@@ -925,10 +1151,9 @@
 
   function showCalendar(anchorElement) {
     if (!calendarOverlay) createCalendarOverlay();
-    const rect = anchorElement.getBoundingClientRect();
-    calendarOverlay.style.top = (rect.bottom + 5) + 'px';
-    calendarOverlay.style.left = Math.min(rect.left, window.innerWidth - 300) + 'px';
     calendarOverlay.style.display = 'block';
+    // 从当前页面数据确定显示的月份
+    updateCalendarMonthFromData();
     // 重新渲染内容
     calendarOverlay.innerHTML = '';
     const header = document.createElement('div');
@@ -937,78 +1162,303 @@
     header.style.alignItems = 'center';
     header.style.marginBottom = '12px';
     header.style.padding = '0 4px';
+    var navBtnStyle = 'background:none;border:none;cursor:pointer;font-size:12px;padding:2px 8px;border-radius:4px;opacity:0.7';
+    var navBtnHover = 'background:rgba(128,128,128,0.15);opacity:1';
     const prevBtn = document.createElement('button');
     prevBtn.textContent = '◀';
-    prevBtn.className = 'ds-btn';
-    prevBtn.style.width = '28px';
-    prevBtn.style.height = '28px';
-    prevBtn.addEventListener('click', (e) => {
+    prevBtn.style.cssText = navBtnStyle;
+    prevBtn.title = '上个月';
+    prevBtn.addEventListener('mouseenter', function() { prevBtn.style.cssText = navBtnStyle + ';' + navBtnHover; });
+    prevBtn.addEventListener('mouseleave', function() { prevBtn.style.cssText = navBtnStyle; });
+    prevBtn.addEventListener('click', function(e) {
       e.stopPropagation();
       currentCalendarMonth--;
-      if (currentCalendarMonth < 0) {
-        currentCalendarMonth = 11;
-        currentCalendarYear--;
-      }
-      var _y = currentCalendarYear, _m = currentCalendarMonth;
-      fetchMonthData(_y, _m).then(function() { renderCalendarContent(); }).catch(function() { renderCalendarContent(); });
+      if (currentCalendarMonth < 0) { currentCalendarMonth = 11; currentCalendarYear--; }
+      if (currentViewMode === 'range') { rangePhase = 'select-start'; rangeStartDate = null; rangeEndDate = null; }
+      calendarCursorDate = null;
+      renderCalendarContent();
     });
     const monthYear = document.createElement('span');
     monthYear.style.fontWeight = '600';
     monthYear.style.fontSize = '13px';
     const updateMonthYear = () => {
-      monthYear.textContent = `${currentCalendarYear}年 ${currentCalendarMonth + 1}月`;
+      monthYear.textContent = currentCalendarYear + '年 ' + (currentCalendarMonth + 1) + '月';
     };
     const nextBtn = document.createElement('button');
     nextBtn.textContent = '▶';
-    nextBtn.className = 'ds-btn';
-    nextBtn.style.width = '28px';
-    nextBtn.style.height = '28px';
-    nextBtn.addEventListener('click', (e) => {
+    nextBtn.style.cssText = navBtnStyle;
+    nextBtn.title = '下个月';
+    nextBtn.addEventListener('mouseenter', function() { nextBtn.style.cssText = navBtnStyle + ';' + navBtnHover; });
+    nextBtn.addEventListener('mouseleave', function() { nextBtn.style.cssText = navBtnStyle; });
+    nextBtn.addEventListener('click', function(e) {
       e.stopPropagation();
       currentCalendarMonth++;
-      if (currentCalendarMonth > 11) {
-        currentCalendarMonth = 0;
-        currentCalendarYear++;
-      }
-      var _y = currentCalendarYear, _m = currentCalendarMonth;
-      fetchMonthData(_y, _m).then(function() { renderCalendarContent(); }).catch(function() { renderCalendarContent(); });
+      if (currentCalendarMonth > 11) { currentCalendarMonth = 0; currentCalendarYear++; }
+      if (currentViewMode === 'range') { rangePhase = 'select-start'; rangeStartDate = null; rangeEndDate = null; }
+      calendarCursorDate = null;
+      renderCalendarContent();
     });
-    const leftGroup = document.createElement('div');
-    leftGroup.style.display = 'flex';
-    leftGroup.style.alignItems = 'center';
-    leftGroup.style.gap = '2px';
-    leftGroup.appendChild(prevBtn);
-    const todayBtn = document.createElement('button');
-    todayBtn.textContent = '今天';
-    todayBtn.className = 'ds-calendar-today-btn';
-    todayBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const now = new Date();
-      currentCalendarYear = now.getFullYear();
-      currentCalendarMonth = now.getMonth();
-      var _y = currentCalendarYear, _m = currentCalendarMonth;
-      fetchMonthData(_y, _m).then(function() { renderCalendarContent(); }).catch(function() { renderCalendarContent(); });
-    });
-    leftGroup.appendChild(todayBtn);
-    header.appendChild(leftGroup);
+    header.appendChild(prevBtn);
     header.appendChild(monthYear);
     header.appendChild(nextBtn);
     calendarOverlay.appendChild(header);
+
+    // 视图切换标签
+    const tabsDiv = document.createElement('div');
+    tabsDiv.className = 'ds-view-tabs';
+    var tabs = ['month', 'week', 'range'];
+    var tabLabels = { month: '月', week: '周', range: '范围' };
+    for (var ti = 0; ti < tabs.length; ti++) {
+      (function(mode) {
+        var tab = document.createElement('button');
+        tab.className = 'ds-view-tab' + (mode === currentViewMode ? ' active' : '');
+        tab.textContent = tabLabels[mode];
+        tab.addEventListener('click', function(e) {
+          e.stopPropagation();
+          if (mode !== currentViewMode) {
+            currentViewMode = mode;
+            if (mode === 'range') {
+              rangePhase = 'select-start';
+              rangeStartDate = null;
+              rangeEndDate = null;
+            }
+            renderCalendarContent();
+          }
+        });
+        tabsDiv.appendChild(tab);
+      })(tabs[ti]);
+    }
+    calendarOverlay.appendChild(tabsDiv);
+
     const calendarContainer = document.createElement('div');
     calendarContainer.id = 'ds-calendar-grid';
     calendarOverlay.appendChild(calendarContainer);
-    const renderCalendarContent = () => {
+
+    // 范围指示器
+    const rangeIndicator = document.createElement('div');
+    rangeIndicator.className = 'ds-range-indicator';
+    calendarOverlay.appendChild(rangeIndicator);
+
+    function updateViewTabs() {
+      var btns = tabsDiv.querySelectorAll('.ds-view-tab');
+      for (var i = 0; i < btns.length; i++) {
+        btns[i].className = 'ds-view-tab' + (tabs[i] === currentViewMode ? ' active' : '');
+      }
+    }
+
+    function setupRangeSelection() {
+      var cells = calendarContainer.querySelectorAll('.ds-calendar-day');
+      for (var i = 0; i < cells.length; i++) {
+        (function(span) {
+          // 使用 data-date 属性
+          var td = span.closest('td');
+          if (!td) return;
+          var dateStr = td.getAttribute('data-date');
+          if (!dateStr) return;
+
+          // 替换 click 事件（移除原有监听 + 新增范围选择行为）
+          var newSpan = span.cloneNode(true);
+          span.parentNode.replaceChild(newSpan, span);
+
+          newSpan.addEventListener('click', function(e) {
+            e.stopPropagation();
+            if (rangePhase === 'select-start') {
+              rangeStartDate = dateStr;
+              rangePhase = 'select-end';
+              renderCalendarContent();
+            } else if (rangePhase === 'select-end') {
+              // 确保结束日期 ≥ 起始日期
+              if (dateStr < rangeStartDate) {
+                rangeEndDate = rangeStartDate;
+                rangeStartDate = dateStr;
+              } else {
+                rangeEndDate = dateStr;
+              }
+              rangePhase = 'done';
+              renderCalendarContent();
+            }
+          });
+
+          // 保留 hover tooltip
+          var dayData = dailyDataMap.get(dateStr);
+          if (dayData) {
+            newSpan.addEventListener('mouseenter', function(e) { showCalendarTooltip(e, dayData); });
+            newSpan.addEventListener('mouseleave', function() { hideCalendarTooltip(); });
+          }
+        })(cells[i]);
+      }
+    }
+
+    function highlightRange() {
+      if (!rangeStartDate) return;
+      var start = new Date(rangeStartDate + 'T00:00:00Z');
+      var end = rangeEndDate ? new Date(rangeEndDate + 'T00:00:00Z') : null;
+
+      var allTds = calendarContainer.querySelectorAll('td[data-date]');
+      for (var i = 0; i < allTds.length; i++) {
+        (function(td) {
+          var span = td.querySelector('.ds-calendar-day');
+          if (!span) return;
+          var dateStr = td.getAttribute('data-date');
+          var d = new Date(dateStr + 'T00:00:00Z');
+
+          if (end && d >= start && d <= end) {
+            span.classList.add('range-cell');
+            if (dateStr === rangeStartDate) span.classList.add('range-start');
+            else if (dateStr === rangeEndDate) span.classList.add('range-end');
+            else span.classList.add('range-mid');
+          } else if (!end && dateStr === rangeStartDate) {
+            span.classList.add('range-start');
+          }
+        })(allTds[i]);
+      }
+    }
+
+    var renderCalendarContent = function() {
       calendarContainer.innerHTML = '';
+      rangeIndicator.innerHTML = '';
       updateMonthYear();
-      renderCalendar(calendarContainer, currentCalendarYear, currentCalendarMonth);
-      const summary = buildMonthlySummary(currentCalendarYear, currentCalendarMonth);
-      calendarContainer.appendChild(summary);
+      updateViewTabs();
+
+      if (currentViewMode === 'month') {
+        renderCalendar(calendarContainer, currentCalendarYear, currentCalendarMonth);
+        var summary = buildMonthlySummary(currentCalendarYear, currentCalendarMonth);
+        calendarContainer.appendChild(summary);
+      } else if (currentViewMode === 'week') {
+        renderWeekView(calendarContainer, currentCalendarYear, currentCalendarMonth);
+      } else if (currentViewMode === 'range') {
+        renderCalendar(calendarContainer, currentCalendarYear, currentCalendarMonth);
+        // 范围模式提示
+        if (rangePhase === 'select-start') {
+          rangeIndicator.textContent = '请点击起始日期';
+        } else if (rangePhase === 'select-end') {
+          rangeIndicator.textContent = '请点击结束日期';
+        } else if (rangePhase === 'done' && rangeStartDate && rangeEndDate) {
+          rangeIndicator.innerHTML = '已选择 <b>' + rangeStartDate + '</b> 至 <b>' + rangeEndDate + '</b>';
+        } else if (rangePhase === 'idle') {
+          // 数据刷新后自动进入起始选择模式
+          rangePhase = 'select-start';
+          rangeIndicator.textContent = '请点击起始日期';
+        }
+        // 替换 click 行为为范围选择
+        setupRangeSelection();
+        // 高亮已选范围
+        if (rangeStartDate) highlightRange();
+        // 范围统计
+        if (rangePhase === 'done' && rangeStartDate && rangeEndDate) {
+          var rangeSummary = buildRangeSummary(rangeStartDate, rangeEndDate);
+          var summaryDiv = document.createElement('div');
+          summaryDiv.className = 'ds-calendar-summary';
+          summaryDiv.innerHTML =
+            '<span>范围合计</span>' +
+            '<span>费用 <b>￥' + rangeSummary.totalCost.toFixed(2) + '</b></span>' +
+            '<span>Token <b>' + fmtNumShort(rangeSummary.totalTokens) + '</b></span>' +
+            '<span>请求 <b>' + rangeSummary.totalRequests.toLocaleString() + '</b></span>' +
+            '<span>Pro ' + fmtNumShort(rangeSummary.proTokens) + ' | Flash ' + fmtNumShort(rangeSummary.flashTokens) + '</span>' +
+            '<span>天数 ' + rangeSummary.dayCount + '</span>' +
+            '<span>缓存 <b>' + (rangeSummary.overallHitRate !== null ? rangeSummary.overallHitRate.toFixed(1) + '%' : '—') + '</b></span>';
+          calendarContainer.appendChild(summaryDiv);
+          // 清除范围按钮
+          var clearBtn = document.createElement('div');
+          clearBtn.className = 'ds-range-clear';
+          clearBtn.textContent = '清除范围，重新选择';
+          clearBtn.addEventListener('click', function(e) {
+            e.stopPropagation();
+            rangePhase = 'select-start';
+            rangeStartDate = null;
+            rangeEndDate = null;
+            renderCalendarContent();
+          });
+          calendarContainer.appendChild(clearBtn);
+        }
+      }
     };
+    calendarRefreshFn = renderCalendarContent;
     renderCalendarContent();
+
+    // 内容渲染后重新定位，确保不遮挡监控面板
+    var _panelEl = document.getElementById('ds-monitor-panel');
+    if (_panelEl) {
+      var _panelRect = _panelEl.getBoundingClientRect();
+      var _calW = calendarOverlay.offsetWidth || 320;
+      calendarOverlay.style.top = Math.max(8, _panelRect.top) + 'px';
+      calendarOverlay.style.left = Math.max(8, _panelRect.left - _calW - 8) + 'px';
+      calendarOverlay.style.right = 'auto';
+    }
+
+    // 键盘导航
+    function onCalendarKeydown(e) {
+      if (!calendarOverlay || calendarOverlay.style.display !== 'block') return;
+
+      if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+        e.preventDefault();
+        e.stopPropagation();
+
+        if (!calendarCursorDate) {
+          // 首次按键：从当天或当月首日开始
+          var d = new Date();
+          if (d.getFullYear() !== currentCalendarYear || d.getMonth() !== currentCalendarMonth) {
+            d = new Date(currentCalendarYear, currentCalendarMonth, 1);
+          }
+          calendarCursorDate = localDateStr(d);
+        }
+
+        var parts = calendarCursorDate.split('-');
+        var cur = new Date(parseInt(parts[0]), parseInt(parts[1]) - 1, parseInt(parts[2]));
+        cur.setDate(cur.getDate() + (e.key === 'ArrowRight' ? 1 : -1));
+
+        // 限制在当前月份内
+        var first = new Date(currentCalendarYear, currentCalendarMonth, 1);
+        var last = new Date(currentCalendarYear, currentCalendarMonth + 1, 0);
+        if (cur < first) cur = first;
+        if (cur > last) cur = last;
+
+        calendarCursorDate = localDateStr(cur);
+        renderCalendarContent();
+
+        // 有数据时显示 tooltip
+        var dayData = dailyDataMap.get(calendarCursorDate);
+        if (dayData) {
+          var focusedEl = calendarOverlay.querySelector('[data-date="' + calendarCursorDate + '"] .ds-calendar-day');
+          if (focusedEl) {
+            showCalendarTooltip({ target: focusedEl }, dayData);
+          }
+        } else {
+          hideCalendarTooltip();
+        }
+        return;
+      }
+
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        var targetDate = calendarCursorDate || selectedDate;
+        if (targetDate && dailyDataMap.has(targetDate)) {
+          showDateDetail(targetDate);
+          closeCalendar();
+        }
+        return;
+      }
+
+      if (e.key === 'Escape') {
+        closeCalendar();
+        return;
+      }
+    }
+
+    document.addEventListener('keydown', onCalendarKeydown);
+    calendarOverlay._keydownHandler = onCalendarKeydown;
   }
 
   function closeCalendar() {
-    if (calendarOverlay) calendarOverlay.style.display = 'none';
+    if (calendarOverlay) {
+      calendarOverlay.style.display = 'none';
+      // 移除键盘监听
+      if (calendarOverlay._keydownHandler) {
+        document.removeEventListener('keydown', calendarOverlay._keydownHandler);
+        calendarOverlay._keydownHandler = null;
+      }
+      calendarCursorDate = null;
+    }
   }
 
   // ============================================================
